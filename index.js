@@ -1216,6 +1216,9 @@ export function apply(ctx) {
             const g = findGroup(s, groupKey)
             if (g) g.rounds = roundNo
           })
+          // 关键：本轮必须先把 state 落盘再释放群队列；否则下一轮 loadStateInPlugin()
+          // 会读到 150ms 合并写之前的旧快照，丢掉上一轮的 log/rounds（实测 log=5、rounds=1）。
+          await flushStateWrites()
           const file = await appendRoundFile(group, roundEntries.map(entry => `${entry.who}：${entry.text}`), roundNo)
           return file
         }
