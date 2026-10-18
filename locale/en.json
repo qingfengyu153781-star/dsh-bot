@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Workspace Bots",
+    "description": "Workspace-scoped Bots with per-workspace memory; group chats are real sessions."
+  }
+}

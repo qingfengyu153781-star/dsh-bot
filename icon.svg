@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Workspace Bots">
+  <rect x="4" y="4" width="56" height="56" rx="12" fill="#1f6feb" opacity="0.12"/>
+  <rect x="14" y="20" width="36" height="26" rx="7" fill="none" stroke="#1f6feb" stroke-width="3"/>
+  <circle cx="25" cy="32" r="3" fill="#1f6feb"/>
+  <circle cx="39" cy="32" r="3" fill="#1f6feb"/>
+  <path d="M25 39h14" stroke="#1f6feb" stroke-width="3" stroke-linecap="round"/>
+  <path d="M32 20v-6" stroke="#1f6feb" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="12" r="3" fill="#1f6feb"/>
+  <path d="M14 26H8M56 26h-6M14 40H8M56 40h-6" stroke="#1f6feb" stroke-width="3" stroke-linecap="round"/>
+</svg>
