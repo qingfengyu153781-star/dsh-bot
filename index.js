@@ -1149,7 +1149,13 @@ export function apply(ctx) {
           return g.mode
         })
         if (mode === null) return fail(`Unknown group: ${args.group}`)
-        return ok(`群「${group.name}」发言模式已设为 ${mode}${mode === 'round-robin' ? '（成员依次发言，后者能看到前者）' : '（只有群会话自己回）'}。`)
+        const tail =
+          mode === 'round-robin'
+            ? '（成员依次发言，后者能看到前者）'
+            : mode === 'parallel'
+              ? '（同一议题并发发给全部成员，本轮互相看不到）'
+              : '（只有群会话自己回）'
+        return ok(`群「${group.name}」发言模式已设为 ${mode}${tail}。`)
       })
     },
   })
