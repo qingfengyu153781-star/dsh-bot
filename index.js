@@ -1300,7 +1300,7 @@ export function apply(ctx) {
   })
 
   tool({
-    name: 'memory_remember',
+    name: 'workspace_memory_remember',
     description:
       'Append a note to ONE workspace memory. Each workspace keeps its own memory file, so notes never leak across projects. Use topic to file it under a named section file.',
     parameters: {
@@ -1343,7 +1343,7 @@ export function apply(ctx) {
   })
 
   tool({
-    name: 'memory_recall',
+    name: 'workspace_memory_recall',
     description: 'Read one workspace memory. Optionally filter by a plain-text query.',
     parameters: {
       type: 'object',

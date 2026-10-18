@@ -22,7 +22,7 @@
 | `bot_attach` 整理工作区 | ✅ | ✅ | ❌ 拒绝 |
 | `group_create` 建群 | ✅ | ✅ | ❌ 拒绝 |
 | `group_post` / `group_read` | ✅ | ✅ | ✅ |
-| `memory_remember` / `memory_recall` | ✅ | ✅ | ✅（只限本工作区） |
+| `workspace_memory_remember` / `workspace_memory_recall` | ✅ | ✅ | ✅（只限本工作区） |
 
 主位判定不靠名字：Bot 记录上有 `main: true`，一个工作区最多一个；切换时自动撤销旧主位，`changed` 会带 `名字#短id`（同名也能分辨）。
 
@@ -40,7 +40,7 @@
 | `group_post` | 往群里发；`round-robin` 模式下成员按顺序依次发言 |
 | `group_read` | 读群的共享记录（成员看到的是同一条有序对话） |
 | `group_set_mode` | 切换 `broadcast` / `round-robin`（仅主 Bot / 用户） |
-| `memory_remember` / `memory_recall` | 写 / 读某个工作区的记忆 |
+| `workspace_memory_remember` / `workspace_memory_recall` | 写 / 读某个工作区的记忆 |
 | `session_probe` | 诊断一条会话：inspect / projections / page / resolveAgent / 命令表 |
 
 ## 群聊的两种模式
