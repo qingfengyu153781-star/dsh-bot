@@ -341,7 +341,8 @@ export function apply(ctx) {
     try {
       const registry = ctx.get('workspaceRegistry')
       if (registry !== undefined && typeof registry.unarchiveSession === 'function') {
-        await registry.unarchiveSession({ sessionId })
+        // 签名是 unarchiveSession(sessionId: string)，不是对象（对象形式会被拒，之前就是这样静默失败的）
+        await registry.unarchiveSession(sessionId)
       }
     } catch {
       // 没有该能力或本来就没归档：忽略
