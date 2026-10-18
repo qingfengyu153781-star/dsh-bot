@@ -504,9 +504,19 @@ export function apply(ctx) {
     return text
   }
 
-  /** 群模式：broadcast（默认，投给群会话）/ round-robin（成员依次发言）。 */
+  /**
+   * 群发言模式：broadcast（默认，只投给群会话）/ round-robin（成员依次发言）/ parallel（同一议题并发发给全部成员）。
+   * ★ 不接受未知识别值：旧实现把不认识的值一律落回 broadcast 并回"已设为 broadcast"，
+   *   那等于静默改语义（用户明确反对）。这里抛错，让调用方看见。
+   */
+  const GROUP_MODES = ['broadcast', 'round-robin', 'parallel']
   function normalizeGroupMode(value) {
-    return value === 'round-robin' ? 'round-robin' : 'broadcast'
+    const mode = String(value ?? '').trim()
+    if (mode === '') return 'broadcast'
+    if (!GROUP_MODES.includes(mode)) {
+      fail(`不支持的群模式：${mode}。可选：${GROUP_MODES.join(' / ')}。`)
+    }
+    return mode
   }
 
 
@@ -521,6 +531,69 @@ export function apply(ctx) {
     group.log.push(item)
     if (group.log.length > 300) group.log = group.log.slice(-300)
     return item
+  }
+
+  /**
+   * 每轮自动留档：<workspace>/讨论/群聊记录_<群名>.md（追加写）。
+   * 目的：会话日志之外留一份人可读的记录，重启/换会话也找得回来。
+   */
+  async function appendRoundFile(group, lines, roundNo) {
+    try {
+      const dir = join(group.workspace, '讨论')
+      await mkdir(dir, { recursive: true })
+      const safeName = String(group.name).replace(/[\\/:*?"<>|]/g, '_')
+      const file = join(dir, `群聊记录_${safeName}.md`)
+      const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19)
+      const body = [`## 第 ${roundNo} 轮 · ${stamp}`, '', ...lines.map(line => `- ${line}`), ''].join('\n')
+      await appendFile(file, body, 'utf8')
+      return file
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * 本轮发言者与顺序：默认 admin 先、其余按登记顺序；
+   * 传 members（名字或 id 组成的数组）时**只叫这些人，并按给定顺序**（常用来点两三个人互挑）。
+   */
+  function resolveGroupOrder(state, group, requested) {
+    const pool = (group.members ?? [])
+      .map(id => state.bots[id] ?? Object.values(state.bots).find(bot => bot.sessionId === id))
+      .filter(Boolean)
+    if (Array.isArray(requested) && requested.length > 0) {
+      const picked = []
+      for (const key of requested) {
+        const bot = findBot(state, key) ?? pool.find(item => item.name === key)
+        if (bot !== undefined && !picked.some(item => item.id === bot.id)) picked.push(bot)
+      }
+      return picked
+    }
+    const admin = pool.find(bot => bot.id === group.admin) ?? pool[0]
+    return admin === undefined ? pool : [admin, ...pool.filter(bot => bot.id !== admin.id)]
+  }
+
+  /**
+   * 叫一位成员发言；空回复/[PASS] 时**重试一次**，仍不行就带回失败原因。
+   * 旧实现只写「(未发言)」，看不出是超时、被闸、还是真的没话说。
+   */
+  async function askMember(member, buildPrompt, timeoutMs) {
+    const first = await lastSeq(member.sessionId)
+    try {
+      await promptSession(member.sessionId, buildPrompt())
+    } catch (error) {
+      return { reply: '', reason: `投递失败：${error && error.message ? error.message : String(error)}` }
+    }
+    let reply = (await waitForReply(member.sessionId, first, timeoutMs)).trim()
+    if (reply !== '' && !/^\[PASS\]$/i.test(reply)) return { reply, reason: '' }
+    const retryFrom = await lastSeq(member.sessionId)
+    try {
+      await promptSession(member.sessionId, '上一条没有收到你的回应。请只用一两句话直接说你的内容；确实无话可说才回 [PASS]。')
+      reply = (await waitForReply(member.sessionId, retryFrom, Math.min(60_000, timeoutMs))).trim()
+    } catch {
+      // 落到下面的失败原因
+    }
+    if (reply !== '' && !/^\[PASS\]$/i.test(reply)) return { reply, reason: '' }
+    return { reply: '', reason: reply === '' ? '重试一次仍超时/无回应' : '回了 [PASS]' }
   }
 
   tool({
@@ -706,9 +779,10 @@ export function apply(ctx) {
       type: 'object',
       properties: {
         bot: { type: 'string', description: 'Bot name or id.' },
-        text: { type: 'string', description: 'Message to deliver.' },
+        text: { type: 'string', description: 'Message to deliver. `message` 是同一参数的别名。' },
+        message: { type: 'string', description: 'Alias of `text`；两者给一个即可。' },
       },
-      required: ['bot', 'text'],
+      required: ['bot'],
       additionalProperties: false,
     },
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
@@ -716,7 +790,9 @@ export function apply(ctx) {
       const state = await loadStateInPlugin()
       const bot = findBot(state, args.bot)
       if (!bot) return fail(`Unknown Bot: ${args.bot}`)
-      await promptSession(bot.sessionId, args.text)
+      const body = String(args.text ?? args.message ?? '').trim()
+      if (body === '') return fail('bot_message 需要非空的 text（或 message）。')
+      await promptSession(bot.sessionId, body)
       // P2-3：prompt 只承诺「入队」。再探一次 agent 是否真能起来，把两种状态分开报。
       let wake = 'unknown'
       let code = ''
@@ -850,7 +926,7 @@ export function apply(ctx) {
         workspace: { type: 'string', description: 'Absolute workspace directory for the group Session.' },
         members: { type: 'array', items: { type: 'string' }, description: 'Bot names to involve.' },
         sessionId: { type: 'string', description: 'Optional: adopt this existing Session as the group instead of creating a new one.' },
-        mode: { type: 'string', enum: ['broadcast', 'round-robin'], description: 'broadcast（默认，只有群会话自己回）或 round-robin（成员轮流发言，后者能看到前者）。' },
+        mode: { type: 'string', enum: ['broadcast', 'round-robin', 'parallel'], description: 'broadcast（默认，只有群会话自己回）/ round-robin（成员轮流发言，后者能看到前者）/ parallel（同一议题并发发给全部成员，互相看不到本轮）。' },
       },
       required: ['name', 'workspace'],
       additionalProperties: false,
@@ -921,6 +997,11 @@ export function apply(ctx) {
         group: { type: 'string', description: 'Group name or id.' },
         text: { type: 'string', description: 'Message text.' },
         from: { type: 'string', description: 'Optional speaker label, such as a Bot name.' },
+        members: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '可选：本轮只叫这些成员（名字或 id），按给定顺序；省略＝默认顺序（admin 先）。',
+        },
       },
       required: ['group', 'text'],
       additionalProperties: false,
@@ -938,76 +1019,99 @@ export function apply(ctx) {
         const group = findGroup(state, args.group) ?? findGroup(state, groupKey)
         if (!group) return fail(`Unknown group: ${args.group}`)
         await ensureUnarchived(group.sessionId)
-        const mode = group.mode === 'round-robin' ? 'round-robin' : 'broadcast'
+        // 不认识的模式直接报错，不再静默落回 broadcast（那等于改了语义还不说）。
+        const mode = normalizeGroupMode(group.mode)
+        const text = String(args.text ?? '').trim()
+        if (text === '') return fail('group_post 需要非空的 text。')
         if (mode === 'broadcast') {
           const prefix = args.from ? `[${args.from}] ` : ''
-          await promptSession(group.sessionId, `${prefix}${args.text}`)
+          await promptSession(group.sessionId, `${prefix}${text}`)
           return ok(`Posted to ${group.name} (session ${group.sessionId})，模式 broadcast（只有群会话自己的 agent 会回）。`)
         }
 
-        // ── 轮流发言（对齐 ds-bot 的做法）─────────────────────────────
-        // 群聊是**一条共享的有序对话**：每条发言都进同一个 room log；
-        // 每位成员收到的 prompt 里带上「本轮之前的上下文」与「本轮已发言的部分」，
-        // 并被告知自己是第几个、前/后各有几个人 —— 这样才是在同一个群里接话，
-        // 而不是把同一句话挨个私聊一遍。
-        const members = (group.members ?? [])
-          .map(id => state.bots[id] ?? Object.values(state.bots).find(bot => bot.sessionId === id))
-          .filter(Boolean)
-        const admin = members.find(bot => bot.id === group.admin) ?? members[0]
-        const order = admin === undefined ? members : [admin, ...members.filter(bot => bot.id !== admin.id)]
+        // ── 共享一条有序对话（round-robin / parallel 共用）─────────────
+        // 每条发言都进同一个 room log；成员看到的 context 来自这份 log，
+        // 而不是各自的私聊历史 —— 这样才是在同一个群里说话。
+        const order = resolveGroupOrder(state, group, args.members)
         const who = args.from || '用户'
-        // ★ 每落一条就短事务 load→append→save（不再持有开轮时的旧整状态到轮末）。
+        const roundNo = (typeof group.rounds === 'number' ? group.rounds : 0) + 1
         const prior = await mutateState(s => {
           const g = findGroup(s, groupKey)
           if (!g) return []
-          appendLog(g, { who, role: 'user', text: args.text, time: Date.now() })
+          appendLog(g, { who, role: 'user', text, time: Date.now() })
           return g.log.slice(0, -1).slice(-8).map(line => ({ who: line.who, text: line.text }))
         })
-        await appendVisibleMessage(group.sessionId, who, args.text)
+        await appendVisibleMessage(group.sessionId, who, text)
         if (order.length === 0) {
           return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
         }
-        const roundEntries = [{ who, text: args.text }]
+        const roundEntries = [{ who, text }]
         const replies = []
+
+        const finish = async () => {
+          await mutateState(s => {
+            const g = findGroup(s, groupKey)
+            if (g) g.rounds = roundNo
+          })
+          const file = await appendRoundFile(group, roundEntries.map(entry => `${entry.who}：${entry.text}`), roundNo)
+          return file
+        }
+
+        // ── parallel：同一议题一次发给所有人，并发等待，互不阻塞 ────────
+        if (mode === 'parallel') {
+          const results = await Promise.all(
+            order.map(async member => {
+              const lines = []
+              lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
+              lines.push('本轮是并发讨论：所有成员同时作答，你看不到别人本轮的发言（这是设计），请独立给出你的看法。')
+              if (prior.length > 0) {
+                lines.push(`【本轮之前的上下文，仅供参考】\n${prior.map(line => `${line.who}：${line.text}`).join('\n')}`)
+              }
+              lines.push(`【本议题】\n${who}：${text}`)
+              lines.push('直接说你的内容，不要加名字前缀；确实无话可说才回 [PASS]。')
+              const result = await askMember(member, () => lines.join('\n\n'), 120_000)
+              return { member, ...result }
+            }),
+          )
+          for (const result of results) {
+            const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
+            await mutateState(s => {
+              const g = findGroup(s, groupKey)
+              if (g) appendLog(g, { who: result.member.name, role: result.reply === '' ? 'pass' : 'bot', text: body, time: Date.now() })
+            })
+            if (result.reply !== '') await appendVisibleMessage(group.sessionId, result.member.name, result.reply)
+            roundEntries.push({ who: result.member.name, text: body })
+            replies.push(`${result.member.name}：${body}`)
+          }
+          const file = await finish()
+          return ok(`群「${group.name}」本轮结束（parallel 并发 ${order.length} 位${file ? `，已留档 ${file}` : ''}）：\n\n${replies.join('\n\n')}`)
+        }
+
+        // ── round-robin：成员依次发言，后者能看到前者 ─────────────────
         for (let index = 0; index < order.length; index += 1) {
           const member = order[index]
-          const earlier = prior
-          const current = roundEntries
           const lines = []
           lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
           lines.push('成员一次只一个人说话，每条发言都会先发到群里，下一位才开口。不要重复别人已经说过的内容。')
-          if (earlier.length > 0) {
-            lines.push(`【本轮之前的上下文，仅供参考】\n${earlier.map(line => `${line.who}：${line.text}`).join('\n')}`)
+          if (prior.length > 0) {
+            lines.push(`【本轮之前的上下文，仅供参考】\n${prior.map(line => `${line.who}：${line.text}`).join('\n')}`)
           }
-          lines.push(`【本轮到目前为止（从旧到新）】\n${current.map(line => `${line.who}：${line.text}`).join('\n')}`)
+          lines.push(`【本轮到目前为止（从旧到新）】\n${roundEntries.map(line => `${line.who}：${line.text}`).join('\n')}`)
           lines.push(`本轮发言顺序：${order.map(bot => bot.name).join(' → ')}。`)
           lines.push(`你是第 ${index + 1} / ${order.length} 位：你之前有 ${index} 位发过言，之后还有 ${order.length - index - 1} 位会看到你的发言。`)
           lines.push('直接说你这一轮要说的内容，不要加名字前缀；如果确实没有要补充的，只回 [PASS]。')
-          const since = await lastSeq(member.sessionId)
-          await promptSession(member.sessionId, lines.join('\n\n'))
-          const reply = (await waitForReply(member.sessionId, since, 90_000)).trim()
-          if (reply === '' || /^\[PASS\]$/i.test(reply)) {
-            await mutateState(s => {
-              const g = findGroup(s, groupKey)
-              if (g) appendLog(g, { who: member.name, role: 'pass', text: '(未发言)', time: Date.now() })
-            })
-            roundEntries.push({ who: member.name, text: '(未发言)' })
-            replies.push(`${member.name}：(未发言)`)
-            continue
-          }
+          const result = await askMember(member, () => lines.join('\n\n'), 90_000)
+          const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
           await mutateState(s => {
             const g = findGroup(s, groupKey)
-            if (g) appendLog(g, { who: member.name, role: 'bot', text: reply, time: Date.now() })
+            if (g) appendLog(g, { who: member.name, role: result.reply === '' ? 'pass' : 'bot', text: body, time: Date.now() })
           })
-          await appendVisibleMessage(group.sessionId, member.name, reply)
-          roundEntries.push({ who: member.name, text: reply })
-          replies.push(`${member.name}：${reply}`)
+          if (result.reply !== '') await appendVisibleMessage(group.sessionId, member.name, result.reply)
+          roundEntries.push({ who: member.name, text: body })
+          replies.push(`${member.name}：${body}`)
         }
-        await mutateState(s => {
-          const g = findGroup(s, groupKey)
-          if (g) g.rounds = (typeof g.rounds === 'number' ? g.rounds : 0) + 1
-        })
-        return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}）：\n\n${replies.join('\n\n')}`)
+        const file = await finish()
+        return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}${file ? `，已留档 ${file}` : ''}）：\n\n${replies.join('\n\n')}`)
       })
     },
   })
@@ -1020,7 +1124,7 @@ export function apply(ctx) {
       type: 'object',
       properties: {
         group: { type: 'string', description: 'Group name or id.' },
-        mode: { type: 'string', enum: ['broadcast', 'round-robin'], description: 'broadcast = 只有群会话自己回；round-robin = 成员轮流发言。' },
+        mode: { type: 'string', enum: ['broadcast', 'round-robin', 'parallel'], description: 'broadcast = 只有群会话自己回；round-robin = 成员轮流发言；parallel = 并发发给全部成员。' },
       },
       required: ['group', 'mode'],
       additionalProperties: false,
