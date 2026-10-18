@@ -348,6 +348,37 @@ export function apply(ctx) {
       // 没有该能力或本来就没归档：忽略
     }
   }
+  /**
+   * 把一条发言**写进群会话本身**，这样在 GUI 里打开群会话就能像聊天一样看到。
+   * （group.log 是插件的共享记录；用户看不见 state.json，所以必须镜像进会话日志。）
+   * 走 agent.inject：durable 的 user 角色消息，不唤醒 agent（不会额外触发模型）。
+   * 失败就退回"让群会话自己复述一遍"的方式，保证至少可见。
+   */
+  async function mirrorIntoSession(sessionId, who, text) {
+    const body = `${who}：${text}`
+    try {
+      const resolved = await controller().resolveAgent(sessionId)
+      const agent = resolved && resolved.agent
+      if (agent !== undefined && typeof agent.inject === 'function') {
+        agent.inject({
+          id: randomUUID(),
+          role: 'user',
+          content: [{ type: 'text', text: body }],
+          source: { kind: 'user' },
+        })
+        return 'inject'
+      }
+    } catch {
+      // 落到下面的兜底
+    }
+    try {
+      await promptSession(sessionId, `【群记录 · 原样转述，不要评论】\n${body}`)
+      return 'prompt'
+    } catch {
+      return 'failed'
+    }
+  }
+
   async function promptSession(sessionId, text) {
     await ensureUnarchived(sessionId)
     // prompt 是 Remote 方法，必须带一个取消信号（否则内部 signal.throwIfAborted() 会崩）
@@ -868,6 +899,7 @@ export function apply(ctx) {
       const log = Array.isArray(group.log) ? group.log : []
       const roundStart = log.length
       appendLog(group, { seq: log.length + 1, who: args.from || '用户', role: 'user', text: args.text, time: Date.now() })
+      await mirrorIntoSession(group.sessionId, args.from || '用户', args.text)
       if (order.length === 0) {
         await saveState(state)
         return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
@@ -896,6 +928,7 @@ export function apply(ctx) {
           continue
         }
         appendLog(group, { seq: log.length + 1, who: member.name, role: 'bot', text: reply, time: Date.now() })
+        await mirrorIntoSession(group.sessionId, member.name, reply)
         replies.push(`${member.name}：${reply}`)
       }
       group.rounds = (typeof group.rounds === 'number' ? group.rounds : 0) + 1
