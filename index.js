@@ -28,6 +28,41 @@ const STATE_PATH = join(STATE_DIR, 'state.json')
 
 const EMPTY_STATE = { version: 2, bots: {}, groups: {} }
 
+// ── 并发控制（2026-10-18 生产群压测修复）──────────────────────────────
+// 1) 同一群的 group_post 必须串行（排队）：实测两轮并发会互相穿插、
+//    成员收到两份「本轮上下文」，且 state.json 整对象覆盖导致一轮 group.log 丢失。
+// 2) 状态写入走短事务串行：group_post 每落一条就 load→append→save，
+//    不再把开轮时的旧快照保存到轮末（跨群并发也不会互相覆盖）。
+const GROUP_QUEUES = new Map()
+function serializeGroup(key, task) {
+  const prev = GROUP_QUEUES.get(key) ?? Promise.resolve()
+  const run = prev.then(task, task)
+  const tail = run.then(() => undefined, () => undefined)
+  GROUP_QUEUES.set(key, tail)
+  tail.finally(() => {
+    if (GROUP_QUEUES.get(key) === tail) GROUP_QUEUES.delete(key)
+  })
+  return run
+}
+
+let STATE_CHAIN = Promise.resolve()
+function serializeState(task) {
+  const run = STATE_CHAIN.then(task, task)
+  STATE_CHAIN = run.then(() => undefined, () => undefined)
+  return run
+}
+
+/** 状态短事务：在锁内 load → mutate → save，避免整对象覆盖丢更新。 */
+async function mutateState(mutator) {
+  return serializeState(async () => {
+    const state = await loadState()
+    const value = await mutator(state)
+    await saveState(state)
+    return value
+  })
+}
+
+
 /**
  * 读取状态并做版本迁移（P2-1）：
  *   1 → 2：新增 groups（群聊登记），旧文件没有该字段时补空对象，其余字段原样保留。
@@ -315,14 +350,20 @@ export function apply(ctx) {
             return { kind: 'error', text: '当前对话不是群聊会话，无法切换群模式。' }
           }
           const next = normalizeGroupMode(group.mode) === 'round-robin' ? 'broadcast' : 'round-robin'
-          await setGroupMode(state, group, next)
-          return {
-            kind: 'success',
-            text:
-              next === 'round-robin'
-                ? `群「${group.name}」已切到轮流发言：每个成员依次发言，后一位能看到前一位的话。`
-                : `群「${group.name}」已切回广播：只有群会话自己的 agent 会回。`,
-          }
+          const groupKey = group.id ?? group.sessionId
+          return serializeGroup(groupKey, async () => {
+            await mutateState(s => {
+              const g = findGroup(s, groupKey)
+              if (g) g.mode = next
+            })
+            return {
+              kind: 'success',
+              text:
+                next === 'round-robin'
+                  ? `群「${group.name}」已切到轮流发言：每个成员依次发言，后一位能看到前一位的话。`
+                  : `群「${group.name}」已切回广播：只有群会话自己的 agent 会回。`,
+            }
+          })
         },
       })
       ctx.effect(() => dispose)
@@ -468,18 +509,18 @@ export function apply(ctx) {
     return value === 'round-robin' ? 'round-robin' : 'broadcast'
   }
 
-  async function setGroupMode(state, group, mode) {
-    group.mode = normalizeGroupMode(mode)
-    await saveState(state)
-    return group.mode
-  }
 
   /** 群聊的共享记录：一条一条追加，超过 300 条裁掉最旧的（会话日志仍是真相源）。 */
   function appendLog(group, entry) {
     if (!Array.isArray(group.log)) group.log = []
-    group.log.push(entry)
+    // ★ seq 必须由当前数组长度/上一条推出：旧调用方在 `group.log` 为空时
+    //   用的是另一个局部空数组的 length，导致整轮所有条目 seq 都是 1（实测）。
+    const prevSeq = group.log.length > 0 ? group.log[group.log.length - 1].seq : 0
+    const nextSeq = (typeof prevSeq === 'number' ? prevSeq : group.log.length) + 1
+    const item = { ...entry, seq: nextSeq }
+    group.log.push(item)
     if (group.log.length > 300) group.log = group.log.slice(-300)
-    return entry
+    return item
   }
 
   tool({
@@ -886,65 +927,88 @@ export function apply(ctx) {
     },
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
     async execute(args) {
-      const state = await loadStateInPlugin()
-      const group = findGroup(state, args.group)
-      if (!group) return fail(`Unknown group: ${args.group}`)
-      await ensureUnarchived(group.sessionId)
-      const mode = group.mode === 'round-robin' ? 'round-robin' : 'broadcast'
-      if (mode === 'broadcast') {
-        const prefix = args.from ? `[${args.from}] ` : ''
-        await promptSession(group.sessionId, `${prefix}${args.text}`)
-        return ok(`Posted to ${group.name} (session ${group.sessionId})，模式 broadcast（只有群会话自己的 agent 会回）。`)
-      }
+      const initial = await loadStateInPlugin()
+      const found = findGroup(initial, args.group)
+      if (!found) return fail(`Unknown group: ${args.group}`)
+      // ★ 2026-10-18 压测修复：同一群按 id 串行排队。排队后再重读 state，
+      //   保证第二轮看到第一轮已落盘的 group.log/rounds，不会两份旧快照互相覆盖。
+      const groupKey = found.id ?? found.sessionId ?? args.group
+      return serializeGroup(groupKey, async () => {
+        const state = await loadStateInPlugin()
+        const group = findGroup(state, args.group) ?? findGroup(state, groupKey)
+        if (!group) return fail(`Unknown group: ${args.group}`)
+        await ensureUnarchived(group.sessionId)
+        const mode = group.mode === 'round-robin' ? 'round-robin' : 'broadcast'
+        if (mode === 'broadcast') {
+          const prefix = args.from ? `[${args.from}] ` : ''
+          await promptSession(group.sessionId, `${prefix}${args.text}`)
+          return ok(`Posted to ${group.name} (session ${group.sessionId})，模式 broadcast（只有群会话自己的 agent 会回）。`)
+        }
 
-      // ── 轮流发言（对齐 ds-bot 的做法）─────────────────────────────
-      // 群聊是**一条共享的有序对话**：每条发言都进同一个 room log；
-      // 每位成员收到的 prompt 里带上「本轮之前的上下文」与「本轮已发言的部分」，
-      // 并被告知自己是第几个、前/后各有几个人 —— 这样才是在同一个群里接话，
-      // 而不是把同一句话挨个私聊一遍。
-      const members = (group.members ?? [])
-        .map(id => state.bots[id] ?? Object.values(state.bots).find(bot => bot.sessionId === id))
-        .filter(Boolean)
-      const admin = members.find(bot => bot.id === group.admin) ?? members[0]
-      const order = admin === undefined ? members : [admin, ...members.filter(bot => bot.id !== admin.id)]
-      const log = Array.isArray(group.log) ? group.log : []
-      const roundStart = log.length
-      appendLog(group, { seq: log.length + 1, who: args.from || '用户', role: 'user', text: args.text, time: Date.now() })
-      await appendVisibleMessage(group.sessionId, args.from || '用户', args.text)
-      if (order.length === 0) {
-        await saveState(state)
-        return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
-      }
-      const replies = []
-      for (let index = 0; index < order.length; index += 1) {
-        const member = order[index]
-        const earlier = log.slice(Math.max(0, roundStart - 8), roundStart)
-        const current = log.slice(roundStart)
-        const lines = []
-        lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
-        lines.push('成员一次只一个人说话，每条发言都会先发到群里，下一位才开口。不要重复别人已经说过的内容。')
-        if (earlier.length > 0) {
-          lines.push(`【本轮之前的上下文，仅供参考】\n${earlier.map(line => `${line.who}：${line.text}`).join('\n')}`)
+        // ── 轮流发言（对齐 ds-bot 的做法）─────────────────────────────
+        // 群聊是**一条共享的有序对话**：每条发言都进同一个 room log；
+        // 每位成员收到的 prompt 里带上「本轮之前的上下文」与「本轮已发言的部分」，
+        // 并被告知自己是第几个、前/后各有几个人 —— 这样才是在同一个群里接话，
+        // 而不是把同一句话挨个私聊一遍。
+        const members = (group.members ?? [])
+          .map(id => state.bots[id] ?? Object.values(state.bots).find(bot => bot.sessionId === id))
+          .filter(Boolean)
+        const admin = members.find(bot => bot.id === group.admin) ?? members[0]
+        const order = admin === undefined ? members : [admin, ...members.filter(bot => bot.id !== admin.id)]
+        const who = args.from || '用户'
+        // ★ 每落一条就短事务 load→append→save（不再持有开轮时的旧整状态到轮末）。
+        const prior = await mutateState(s => {
+          const g = findGroup(s, groupKey)
+          if (!g) return []
+          appendLog(g, { who, role: 'user', text: args.text, time: Date.now() })
+          return g.log.slice(0, -1).slice(-8).map(line => ({ who: line.who, text: line.text }))
+        })
+        await appendVisibleMessage(group.sessionId, who, args.text)
+        if (order.length === 0) {
+          return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
         }
-        lines.push(`【本轮到目前为止（从旧到新）】\n${current.map(line => `${line.who}：${line.text}`).join('\n')}`)
-        lines.push(`本轮发言顺序：${order.map(bot => bot.name).join(' → ')}。`)
-        lines.push(`你是第 ${index + 1} / ${order.length} 位：你之前有 ${index} 位发过言，之后还有 ${order.length - index - 1} 位会看到你的发言。`)
-        lines.push('直接说你这一轮要说的内容，不要加名字前缀；如果确实没有要补充的，只回 [PASS]。')
-        const since = await lastSeq(member.sessionId)
-        await promptSession(member.sessionId, lines.join('\n\n'))
-        const reply = (await waitForReply(member.sessionId, since, 90_000)).trim()
-        if (reply === '' || /^\[PASS\]$/i.test(reply)) {
-          appendLog(group, { seq: log.length + 1, who: member.name, role: 'pass', text: '(未发言)', time: Date.now() })
-          replies.push(`${member.name}：(未发言)`)
-          continue
+        const roundEntries = [{ who, text: args.text }]
+        const replies = []
+        for (let index = 0; index < order.length; index += 1) {
+          const member = order[index]
+          const earlier = prior
+          const current = roundEntries
+          const lines = []
+          lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
+          lines.push('成员一次只一个人说话，每条发言都会先发到群里，下一位才开口。不要重复别人已经说过的内容。')
+          if (earlier.length > 0) {
+            lines.push(`【本轮之前的上下文，仅供参考】\n${earlier.map(line => `${line.who}：${line.text}`).join('\n')}`)
+          }
+          lines.push(`【本轮到目前为止（从旧到新）】\n${current.map(line => `${line.who}：${line.text}`).join('\n')}`)
+          lines.push(`本轮发言顺序：${order.map(bot => bot.name).join(' → ')}。`)
+          lines.push(`你是第 ${index + 1} / ${order.length} 位：你之前有 ${index} 位发过言，之后还有 ${order.length - index - 1} 位会看到你的发言。`)
+          lines.push('直接说你这一轮要说的内容，不要加名字前缀；如果确实没有要补充的，只回 [PASS]。')
+          const since = await lastSeq(member.sessionId)
+          await promptSession(member.sessionId, lines.join('\n\n'))
+          const reply = (await waitForReply(member.sessionId, since, 90_000)).trim()
+          if (reply === '' || /^\[PASS\]$/i.test(reply)) {
+            await mutateState(s => {
+              const g = findGroup(s, groupKey)
+              if (g) appendLog(g, { who: member.name, role: 'pass', text: '(未发言)', time: Date.now() })
+            })
+            roundEntries.push({ who: member.name, text: '(未发言)' })
+            replies.push(`${member.name}：(未发言)`)
+            continue
+          }
+          await mutateState(s => {
+            const g = findGroup(s, groupKey)
+            if (g) appendLog(g, { who: member.name, role: 'bot', text: reply, time: Date.now() })
+          })
+          await appendVisibleMessage(group.sessionId, member.name, reply)
+          roundEntries.push({ who: member.name, text: reply })
+          replies.push(`${member.name}：${reply}`)
         }
-        appendLog(group, { seq: log.length + 1, who: member.name, role: 'bot', text: reply, time: Date.now() })
-        await appendVisibleMessage(group.sessionId, member.name, reply)
-        replies.push(`${member.name}：${reply}`)
-      }
-      group.rounds = (typeof group.rounds === 'number' ? group.rounds : 0) + 1
-      await saveState(state)
-      return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}）：\n\n${replies.join('\n\n')}`)
+        await mutateState(s => {
+          const g = findGroup(s, groupKey)
+          if (g) g.rounds = (typeof g.rounds === 'number' ? g.rounds : 0) + 1
+        })
+        return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}）：\n\n${replies.join('\n\n')}`)
+      })
     },
   })
 
@@ -970,9 +1034,19 @@ export function apply(ctx) {
       }
       const group = findGroup(state, args.group)
       if (!group) return fail(`Unknown group: ${args.group}`)
-      await ensureUnarchived(group.sessionId)
-      const mode = await setGroupMode(state, group, args.mode)
-      return ok(`群「${group.name}」发言模式已设为 ${mode}${mode === 'round-robin' ? '（成员依次发言，后者能看到前者）' : '（只有群会话自己回）'}。`)
+      const groupKey = group.id ?? group.sessionId ?? args.group
+      // 与 group_post 共用一个群队列：改模式不会插进正在进行的轮次中间。
+      return serializeGroup(groupKey, async () => {
+        await ensureUnarchived(group.sessionId)
+        const mode = await mutateState(s => {
+          const g = findGroup(s, groupKey)
+          if (!g) return null
+          g.mode = normalizeGroupMode(args.mode)
+          return g.mode
+        })
+        if (mode === null) return fail(`Unknown group: ${args.group}`)
+        return ok(`群「${group.name}」发言模式已设为 ${mode}${mode === 'round-robin' ? '（成员依次发言，后者能看到前者）' : '（只有群会话自己回）'}。`)
+      })
     },
   })
 
@@ -994,39 +1068,54 @@ export function apply(ctx) {
       const group = findGroup(state, args.group)
       const sessionId = group ? group.sessionId : args.group
       const limit = typeof args.limit === 'number' && args.limit > 0 ? args.limit : 20
-      // 群聊优先读**共享记录**（group.log）：那是所有成员看到的那一条有序对话。
-      if (group && Array.isArray(group.log) && group.log.length > 0) {
-        const tailLog = group.log.slice(-limit)
-        const head = `群「${group.name}」· 模式 ${normalizeGroupMode(group.mode)} · 共 ${group.log.length} 条`
-        return ok([head, ...tailLog.map(line => `${line.who}：${line.text}`)].join('\n'))
+      // ★ 2026-10-18 压测修复：**会话是真相源**，优先读会话事件；group.log 只做兜底。
+      //   旧实现只要 log 非空就只回 log，实测并发压测里 log 丢了一轮，
+      //   于是 group_read 把另一轮的 8 条可见发言整体藏掉了。
+      let inspection = null
+      try {
+        inspection = await controller().inspect(sessionId)
+      } catch {
+        inspection = null
       }
-      const inspection = await controller().inspect(sessionId)
       // 会话日志里两类事件的形状不同：
       //   user/message      -> data.content            （直接挂 content）
       //   assistant/message -> data.message.content    （包在 message 里）
       // 早先只读 data.message.content，导致群聊里 85 条用户侧消息全被判"没有消息"。
       const NOISE = ['Current runtime context', '<system-reminder>', '<attention_orchestration', 'Repeated tool call detected']
       const rows = []
-      for (const event of inspection.events ?? []) {
+      for (const event of inspection?.events ?? []) {
         if (event.type !== 'user/message' && event.type !== 'assistant/message') continue
         const parts = event.data?.message?.content ?? event.data?.content ?? []
         const text = parts.filter(part => part && part.type === 'text').map(part => part.text).join('').trim()
         if (text === '') continue
         if (NOISE.some(prefix => text.startsWith(prefix))) continue
-        rows.push(`${event.type === 'user/message' ? 'User' : 'Assistant'}: ${text}`)
+        // 群成员发言本身就是 `who：text` 形态的 user/message，别再叠一层 "User:"。
+        rows.push(event.type === 'user/message' ? text : `Assistant: ${text}`)
       }
       const tail = rows.slice(-limit)
-      if (tail.length === 0) {
-        // 另一会话实测：消息刚发、事件还没落盘时读会得到空。这里给出可判的说明而不是假装"没有消息"。
-        const events = inspection.events ?? []
-        const lastTime = events.reduce((max, event) => (typeof event.time === 'number' && event.time > max ? event.time : max), 0)
-        const ageMs = lastTime > 0 ? Date.now() - lastTime : null
-        if (ageMs !== null && ageMs < 10000) {
-          return ok(`（暂无已落盘的可读消息：该会话最后一次活动在 ${Math.round(ageMs / 1000)} 秒前，事件可能还没写完，稍后再读一次）`)
-        }
-        return ok(`(no messages in ${sessionId})`)
+      if (tail.length > 0) {
+        if (!group) return ok(tail.join('\n\n'))
+        const logCount = Array.isArray(group.log) ? group.log.length : 0
+        const head = `群「${group.name}」· 模式 ${normalizeGroupMode(group.mode)} · 会话可见 ${rows.length} 条`
+        const note = logCount > 0 && logCount !== rows.length
+          ? `\n（派生 group.log ${logCount} 条；与会话不一致时以会话为准）`
+          : ''
+        return ok([head, ...tail].join('\n') + note)
       }
-      return ok(tail.join('\n\n'))
+      // 会话暂无消息：退回 group.log（例如刚写入、事件尚未 flush）
+      if (group && Array.isArray(group.log) && group.log.length > 0) {
+        const tailLog = group.log.slice(-limit)
+        const head = `群「${group.name}」· 模式 ${normalizeGroupMode(group.mode)} · 派生记录 ${group.log.length} 条（会话事件为空）`
+        return ok([head, ...tailLog.map(line => `${line.who}：${line.text}`)].join('\n'))
+      }
+      // 另一会话实测：消息刚发、事件还没落盘时读会得到空。这里给出可判的说明而不是假装"没有消息"。
+      const events = inspection?.events ?? []
+      const lastTime = events.reduce((max, event) => (typeof event.time === 'number' && event.time > max ? event.time : max), 0)
+      const ageMs = lastTime > 0 ? Date.now() - lastTime : null
+      if (ageMs !== null && ageMs < 10000) {
+        return ok(`（暂无已落盘的可读消息：该会话最后一次活动在 ${Math.round(ageMs / 1000)} 秒前，事件可能还没写完，稍后再读一次）`)
+      }
+      return ok(`(no messages in ${sessionId})`)
     },
   })
 

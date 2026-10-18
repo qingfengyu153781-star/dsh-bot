@@ -1,3 +1,22 @@
+# 修复 · 群聊并发/日志一致性（2026-10-18 生产群压测）
+
+生产群「灵枢·灵与脑」8 人 round-robin 压测中实测到三个问题，本笔修复：
+
+1. **同群并发 `group_post` 互相穿插**：两轮同时运行，成员收到两份「本轮上下文」；
+   `state.json` 整对象 last-writer-wins，导致其中一轮 `group.log` 整体丢失。
+   → 按群 id 加串行队列（`serializeGroup`）：同群排队，轮内不会再有第二份快照。
+2. **跨群/跨工具状态覆盖**：所有写状态仍是 load 一次、轮末 save 一次。
+   → 每次落一条改走短事务（`mutateState`: load→append→save，`serializeState` 串行），
+     轮次不再持有开轮快照。
+3. **`group.log` 的 `seq` 整轮都是 1**：`group.log` 为空时，调用方用的是另一个局部空数组的
+   length。→ `appendLog` 统一按「上一条 seq + 1」生成。
+4. **`group_read` 只读 `group.log`**：日志一丢，就把另一轮的可见发言整体藏掉。
+   → 会话事件为真相源、优先读会话；`group.log` 仅作兜底，并在不一致时明示。
+
+验证：`test/group_queue.test.mjs`（11 项）——同群两轮并发（log 6/seq 1..6/rounds 2）、
+跨群并发（两群各 3 条）、`group_read` 在 log 落后时仍能读出会话里的两轮。
+对 HEAD 旧版跑同一用例：4 项红（log=3、seq=[1,1,1]、rounds=1、跨群 G1 log=0）。
+
 # 更新报告 · @local/dsh-bot 0.2.0（2026-10-18）
 
 上一版公开时只有 12 个工具、群聊是"广播式"。这一版补上了**真正的群讨论**和几处会让功能静默失效的缺陷。
