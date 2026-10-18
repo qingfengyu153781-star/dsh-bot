@@ -379,18 +379,19 @@ export function apply(ctx) {
   /**
    * 等某个会话把这一轮说完，返回本轮助手文本（没有就返回空串）。
    * 判据：sinceSeq 之后出现 turn/end；文本取该区间内 assistant/message 的 text 块。
+   * ★ 踩过的坑：turn/end 常常比 assistant/message **先**落盘（实测两次把"已回复"读成空），
+   *   所以看到 turn/end 之后不能立刻返回，要再补读几轮把这一轮的文本收全。
    */
   async function waitForReply(sessionId, sinceSeq, timeoutMs) {
     const deadline = Date.now() + timeoutMs
     let text = ''
-    while (Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 1500))
+    const readOnce = async () => {
       let events
       try {
         const info = await controller().inspect(sessionId)
         events = info.events ?? []
       } catch {
-        continue
+        return { ended: false, parts: [] }
       }
       let ended = false
       const parts = []
@@ -402,8 +403,20 @@ export function apply(ctx) {
         const chunk = content.filter(part => part && part.type === 'text').map(part => part.text).join('').trim()
         if (chunk !== '') parts.push(chunk)
       }
+      return { ended, parts }
+    }
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      const { ended, parts } = await readOnce()
       if (parts.length > 0) text = parts.join('\n').trim()
-      if (ended) return text
+      if (!ended) continue
+      // 已结束：最多再补读 4 次（约 6 秒）等文本落盘
+      for (let extra = 0; extra < 4 && text === ''; extra += 1) {
+        await new Promise(resolve => setTimeout(resolve, 1500))
+        const again = await readOnce()
+        if (again.parts.length > 0) text = again.parts.join('\n').trim()
+      }
+      return text
     }
     return text
   }
@@ -834,6 +847,7 @@ export function apply(ctx) {
       const state = await loadStateInPlugin()
       const group = findGroup(state, args.group)
       if (!group) return fail(`Unknown group: ${args.group}`)
+      await ensureUnarchived(group.sessionId)
       const mode = group.mode === 'round-robin' ? 'round-robin' : 'broadcast'
       if (mode === 'broadcast') {
         const prefix = args.from ? `[${args.from}] ` : ''
@@ -912,6 +926,7 @@ export function apply(ctx) {
       }
       const group = findGroup(state, args.group)
       if (!group) return fail(`Unknown group: ${args.group}`)
+      await ensureUnarchived(group.sessionId)
       const mode = await setGroupMode(state, group, args.mode)
       return ok(`群「${group.name}」发言模式已设为 ${mode}${mode === 'round-robin' ? '（成员依次发言，后者能看到前者）' : '（只有群会话自己回）'}。`)
     },
