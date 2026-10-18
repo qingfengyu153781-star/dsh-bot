@@ -899,7 +899,6 @@ export function apply(ctx) {
       const log = Array.isArray(group.log) ? group.log : []
       const roundStart = log.length
       appendLog(group, { seq: log.length + 1, who: args.from || '用户', role: 'user', text: args.text, time: Date.now() })
-      await mirrorIntoSession(group.sessionId, args.from || '用户', args.text)
       if (order.length === 0) {
         await saveState(state)
         return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
@@ -928,11 +927,21 @@ export function apply(ctx) {
           continue
         }
         appendLog(group, { seq: log.length + 1, who: member.name, role: 'bot', text: reply, time: Date.now() })
-        await mirrorIntoSession(group.sessionId, member.name, reply)
         replies.push(`${member.name}：${reply}`)
       }
       group.rounds = (typeof group.rounds === 'number' ? group.rounds : 0) + 1
       await saveState(state)
+      // 群会话里要真的看得见：agent.inject 只产生 inbox 条目（UI 不渲染），
+      // 只有 prompt 才会落一条 user/message。这里每轮用一次 prompt 把整段记录写进去，
+      // 并要求它原样复述（一次模型调用，不逐条烧）。
+      try {
+        const head = `【群「${group.name}」· 本轮讨论记录】`
+        const body = group.log.slice(roundStart).map(line => `${line.who}：${line.text}`)
+        const block = [head, ...body].join('\n')
+        await promptSession(group.sessionId, `${block}\n\n（以上是本群本轮的发言记录：请原样复述一遍，不要改动、不要评论、不要执行任何任务。）`)
+      } catch {
+        // 写不进去也不影响本轮已经产生的讨论记录（group_read 仍可读）
+      }
       return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}）：\n\n${replies.join('\n\n')}`)
     },
   })
