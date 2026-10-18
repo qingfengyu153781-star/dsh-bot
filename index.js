@@ -354,28 +354,39 @@ export function apply(ctx) {
    * 走 agent.inject：durable 的 user 角色消息，不唤醒 agent（不会额外触发模型）。
    * 失败就退回"让群会话自己复述一遍"的方式，保证至少可见。
    */
-  async function mirrorIntoSession(sessionId, who, text) {
-    const body = `${who}：${text}`
+  /**
+   * 把一条发言**直接写进群会话的事件流**，让它在 GUI 里就是一条聊天消息。
+   * ★ 两条都不行的路已经踩过：
+   *   - agent.inject：只产生 agent/inbox/spliced，UI 不渲染（读回 user/message = 0）；
+   *   - 让群会话"原样复述"：多一次模型调用，且不是子 Bot 之间的对话。
+   * 正确做法是宿主自己的写法：session.append('user/message', message, { surfaceOp:'append' })。
+   * 这样每条发言都是独立一条消息，按时间顺序排在同一条会话里。
+   */
+  async function appendVisibleMessage(sessionId, who, text) {
     try {
       const resolved = await controller().resolveAgent(sessionId)
       const agent = resolved && resolved.agent
-      if (agent !== undefined && typeof agent.inject === 'function') {
-        agent.inject({
+      const session = agent && agent.session
+      if (session === undefined || typeof session.append !== 'function') return false
+      session.append(
+        'user/message',
+        {
           id: randomUUID(),
           role: 'user',
-          content: [{ type: 'text', text: body }],
+          content: [{ type: 'text', text: `${who}：${text}` }],
           source: { kind: 'user' },
-        })
-        return 'inject'
+        },
+        { surfaceOp: 'append' },
+      )
+      try {
+        const sessions = ctx.get('sessions')
+        if (sessions !== undefined && typeof sessions.flush === 'function') await sessions.flush(session)
+      } catch {
+        // 不 flush 也能落盘，只是晚一点
       }
+      return true
     } catch {
-      // 落到下面的兜底
-    }
-    try {
-      await promptSession(sessionId, `【群记录 · 原样转述，不要评论】\n${body}`)
-      return 'prompt'
-    } catch {
-      return 'failed'
+      return false
     }
   }
 
@@ -899,6 +910,7 @@ export function apply(ctx) {
       const log = Array.isArray(group.log) ? group.log : []
       const roundStart = log.length
       appendLog(group, { seq: log.length + 1, who: args.from || '用户', role: 'user', text: args.text, time: Date.now() })
+      await appendVisibleMessage(group.sessionId, args.from || '用户', args.text)
       if (order.length === 0) {
         await saveState(state)
         return ok(`群 ${group.name} 没有可用的成员 Bot；这条消息只记进了群记录。`)
@@ -927,21 +939,11 @@ export function apply(ctx) {
           continue
         }
         appendLog(group, { seq: log.length + 1, who: member.name, role: 'bot', text: reply, time: Date.now() })
+        await appendVisibleMessage(group.sessionId, member.name, reply)
         replies.push(`${member.name}：${reply}`)
       }
       group.rounds = (typeof group.rounds === 'number' ? group.rounds : 0) + 1
       await saveState(state)
-      // 群会话里要真的看得见：agent.inject 只产生 inbox 条目（UI 不渲染），
-      // 只有 prompt 才会落一条 user/message。这里每轮用一次 prompt 把整段记录写进去，
-      // 并要求它原样复述（一次模型调用，不逐条烧）。
-      try {
-        const head = `【群「${group.name}」· 本轮讨论记录】`
-        const body = group.log.slice(roundStart).map(line => `${line.who}：${line.text}`)
-        const block = [head, ...body].join('\n')
-        await promptSession(group.sessionId, `${block}\n\n（以上是本群本轮的发言记录：请原样复述一遍，不要改动、不要评论、不要执行任何任务。）`)
-      } catch {
-        // 写不进去也不影响本轮已经产生的讨论记录（group_read 仍可读）
-      }
       return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}）：\n\n${replies.join('\n\n')}`)
     },
   })
