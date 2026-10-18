@@ -295,6 +295,40 @@ export function apply(ctx) {
   }
   registerMainCommand('主Bot')
   registerMainCommand('main')
+
+  /**
+   * 斜杠命令 /groupmode —— 在本群会话里切换发言模式：
+   * broadcast（只有群会话自己回）↔ round-robin（成员依次发言，后者能看到前者）。
+   */
+  try {
+    const commandService = ctx.get('commands')
+    if (commandService !== undefined) {
+      const dispose = commandService.register({
+        name: 'groupmode',
+        description: '★ 切换本群发言模式：轮流发言（成员互相看见）/ 广播',
+        handler: async invocation => {
+          const state = await loadStateInPlugin()
+          const sid = invocation.agent.id
+          const group = Object.values(state.groups).find(item => item.sessionId === sid)
+          if (group === undefined) {
+            return { kind: 'error', text: '当前对话不是群聊会话，无法切换群模式。' }
+          }
+          const next = normalizeGroupMode(group.mode) === 'round-robin' ? 'broadcast' : 'round-robin'
+          await setGroupMode(state, group, next)
+          return {
+            kind: 'success',
+            text:
+              next === 'round-robin'
+                ? `群「${group.name}」已切到轮流发言：每个成员依次发言，后一位能看到前一位的话。`
+                : `群「${group.name}」已切回广播：只有群会话自己的 agent 会回。`,
+          }
+        },
+      })
+      ctx.effect(() => dispose)
+    }
+  } catch {
+    // 命令注册失败不影响工具
+  }
   /** 在一个会话里放入一条用户消息，并唤醒它。 */
   async function promptSession(sessionId, text) {
     // prompt 是 Remote 方法，必须带一个取消信号（否则内部 signal.throwIfAborted() 会崩）
@@ -307,6 +341,63 @@ export function apply(ctx) {
       },
       new AbortController().signal,
     )
+  }
+
+  /** 该会话当前最后一条事件的序号（轮询起点用）。 */
+  async function lastSeq(sessionId) {
+    try {
+      const info = await controller().inspect(sessionId)
+      let max = 0
+      for (const event of info.events ?? []) {
+        if (typeof event.seq === 'number' && event.seq > max) max = event.seq
+      }
+      return max
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 等某个会话把这一轮说完，返回本轮助手文本（没有就返回空串）。
+   * 判据：sinceSeq 之后出现 turn/end；文本取该区间内 assistant/message 的 text 块。
+   */
+  async function waitForReply(sessionId, sinceSeq, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    let text = ''
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      let events
+      try {
+        const info = await controller().inspect(sessionId)
+        events = info.events ?? []
+      } catch {
+        continue
+      }
+      let ended = false
+      const parts = []
+      for (const event of events) {
+        if (typeof event.seq !== 'number' || event.seq <= sinceSeq) continue
+        if (event.type === 'turn/end') ended = true
+        if (event.type !== 'assistant/message') continue
+        const content = event.data?.message?.content ?? event.data?.content ?? []
+        const chunk = content.filter(part => part && part.type === 'text').map(part => part.text).join('').trim()
+        if (chunk !== '') parts.push(chunk)
+      }
+      if (parts.length > 0) text = parts.join('\n').trim()
+      if (ended) return text
+    }
+    return text
+  }
+
+  /** 群模式：broadcast（默认，投给群会话）/ round-robin（成员依次发言）。 */
+  function normalizeGroupMode(value) {
+    return value === 'round-robin' ? 'round-robin' : 'broadcast'
+  }
+
+  async function setGroupMode(state, group, mode) {
+    group.mode = normalizeGroupMode(mode)
+    await saveState(state)
+    return group.mode
   }
 
   tool({
@@ -636,6 +727,7 @@ export function apply(ctx) {
         workspace: { type: 'string', description: 'Absolute workspace directory for the group Session.' },
         members: { type: 'array', items: { type: 'string' }, description: 'Bot names to involve.' },
         sessionId: { type: 'string', description: 'Optional: adopt this existing Session as the group instead of creating a new one.' },
+        mode: { type: 'string', enum: ['broadcast', 'round-robin'], description: 'broadcast（默认，只有群会话自己回）或 round-robin（成员轮流发言，后者能看到前者）。' },
       },
       required: ['name', 'workspace'],
       additionalProperties: false,
@@ -674,6 +766,7 @@ export function apply(ctx) {
           workspace: args.workspace,
           sessionId: args.sessionId,
           members,
+          mode: normalizeGroupMode(args.mode),
           createdAt: Date.now(),
           adopted: true,
         }
@@ -689,7 +782,7 @@ export function apply(ctx) {
         // 忽略标题失败
       }
       const id = randomUUID()
-      state.groups[id] = { id, name: args.name, workspace: args.workspace, sessionId: created.sessionId, members, createdAt: Date.now() }
+      state.groups[id] = { id, name: args.name, workspace: args.workspace, sessionId: created.sessionId, members, mode: normalizeGroupMode(args.mode), createdAt: Date.now() }
       await saveState(state)
       return ok(`Created group ${args.name} as Session ${created.sessionId} (members: ${members.length}).${note}`)
     },
@@ -714,8 +807,59 @@ export function apply(ctx) {
       const group = findGroup(state, args.group)
       if (!group) return fail(`Unknown group: ${args.group}`)
       const prefix = args.from ? `[${args.from}] ` : ''
-      await promptSession(group.sessionId, `${prefix}${args.text}`)
-      return ok(`Posted to ${group.name} (session ${group.sessionId}).`)
+      const mode = group.mode === 'round-robin' ? 'round-robin' : 'broadcast'
+      if (mode === 'broadcast') {
+        await promptSession(group.sessionId, `${prefix}${args.text}`)
+        return ok(`Posted to ${group.name} (session ${group.sessionId})，模式 broadcast（只有群会话自己的 agent 会回）。`)
+      }
+      // 轮流发言：把消息依次发给每个成员，后面的人能看到前面的人说了什么
+      const members = (group.members ?? [])
+        .map(id => state.bots[id] ?? Object.values(state.bots).find(bot => bot.sessionId === id))
+        .filter(Boolean)
+      if (members.length === 0) {
+        await promptSession(group.sessionId, `${prefix}${args.text}`)
+        return ok(`群 ${group.name} 没有可用的成员 Bot，已按 broadcast 投到群会话。`)
+      }
+      const transcript = []
+      for (const member of members) {
+        const context = transcript.length > 0
+          ? `\n\n【本群此前发言】\n${transcript.join('\n')}\n\n请接着上面的讨论发言，不要重复别人的话。`
+          : '\n\n你是本轮第一位发言者。'
+        const since = await lastSeq(member.sessionId)
+        await promptSession(member.sessionId, `[群「${group.name}」· 轮流发言] ${prefix}${args.text}${context}`)
+        const reply = await waitForReply(member.sessionId, since, 90_000)
+        transcript.push(`${member.name}：${reply === '' ? '（90 秒内没有回应）' : reply}`)
+      }
+      // 群会话留一份完整记录，便于在群里回看
+      await promptSession(group.sessionId, `[群「${group.name}」· 轮流发言记录]\n${transcript.join('\n')}`)
+      return ok(`群 ${group.name} 轮流发言完成（${members.length} 位）：\n\n${transcript.join('\n\n')}`)
+    },
+  })
+
+  tool({
+    name: 'group_set_mode',
+    description:
+      'Switch a group between broadcast (only the group Session agent answers) and round-robin (each member Bot speaks in turn, each seeing what the previous ones said). Only the user or a Main Bot may switch it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        group: { type: 'string', description: 'Group name or id.' },
+        mode: { type: 'string', enum: ['broadcast', 'round-robin'], description: 'broadcast = 只有群会话自己回；round-robin = 成员轮流发言。' },
+      },
+      required: ['group', 'mode'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args, exec) {
+      const state = await loadStateInPlugin()
+      const caller = callerBot(state, exec)
+      if (caller !== undefined && caller.main !== true) {
+        return fail(`只有主 Bot 或用户能改群模式：${caller.name} 是角色 Bot。`)
+      }
+      const group = findGroup(state, args.group)
+      if (!group) return fail(`Unknown group: ${args.group}`)
+      const mode = await setGroupMode(state, group, args.mode)
+      return ok(`群「${group.name}」发言模式已设为 ${mode}${mode === 'round-robin' ? '（成员依次发言，后者能看到前者）' : '（只有群会话自己回）'}。`)
     },
   })
 
