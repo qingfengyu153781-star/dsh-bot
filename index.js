@@ -1082,6 +1082,7 @@ export function apply(ctx) {
           items: { type: 'string' },
           description: '可选：本轮只叫这些成员（名字或 id），按给定顺序；省略＝默认顺序（admin 先）。',
         },
+        concurrency: { type: 'number', description: 'parallel 模式的并发上限；0 或不传＝无上限（全部同时发）。' },
       },
       required: ['group', 'text'],
       additionalProperties: false,
@@ -1139,8 +1140,9 @@ export function apply(ctx) {
 
         // ── parallel：同一议题一次发给所有人，并发等待，互不阻塞 ────────
         if (mode === 'parallel') {
-          // 有界并发（8 路）：一次把几百个成员同时打出去会压垮宿主与供应商。
-          const results = await mapLimit(order, 8, async member => {
+          // 默认**无上限**：全部成员同时发（用户明确要求）。要限流就传 concurrency > 0。
+          const limit = typeof args.concurrency === 'number' && args.concurrency > 0 ? args.concurrency : 0
+          const send = async member => {
               const lines = []
               lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
               lines.push('本轮是并发讨论：所有成员同时作答，你看不到别人本轮的发言（这是设计），请独立给出你的看法。')
@@ -1152,7 +1154,8 @@ export function apply(ctx) {
               lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
               const result = await askMember(member, () => lines.join('\n\n'), 120_000)
               return { member, ...result }
-          })
+          }
+          const results = limit === 0 ? await Promise.all(order.map(send)) : await mapLimit(order, limit, send)
           for (const result of results) {
             const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
             await mutateState(s => {
