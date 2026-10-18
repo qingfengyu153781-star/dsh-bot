@@ -636,7 +636,7 @@ export function apply(ctx) {
     return admin === undefined ? pool : [admin, ...pool.filter(bot => bot.id !== admin.id)]
   }
 
-  /** 有界并发：parallel 一次发太多会把宿主/供应商打满，默认限 8 路。 */
+  /** 有界并发：parallel 一次发太多会把宿主/供应商打满；limit=0 表示不限。 */
   async function mapLimit(items, limit, worker) {
     const results = new Array(items.length)
     let cursor = 0
@@ -652,23 +652,91 @@ export function apply(ctx) {
     return results
   }
 
+  /** 每个 (群 × Bot) 的专属目录：<workspace>/.dsh-bot/groups/<群名>/ */
+  function safeName(value) {
+    return String(value ?? '').replace(/[\\/:*?"<>|]/g, '_')
+  }
+  function memberDirOf(group) {
+    return join(group.workspace, '.dsh-bot', 'groups', safeName(group.name))
+  }
+
+  /**
+   * 根治：每个 Bot 在每个群里分到**一条专属分支会话 + 一个专属记忆文件**。
+   *  · 分支会话：群里发言不带该 Bot 的私聊历史，也不把群内容写进私聊；
+   *  · 记忆文件：<workspace>/.dsh-bot/groups/<群>/<Bot>.md，只属于「这个 Bot 在这个群」。
+   * 已存在且会话仍可用就复用，不重复创建。
+   */
+  async function ensureMemberBranch(state, group, bot) {
+    if (!group.branches || typeof group.branches !== 'object') group.branches = {}
+    const memoryFile = join(memberDirOf(group), `${safeName(bot.name)}.md`)
+    const existing = group.branches[bot.id]
+    if (existing && typeof existing.sessionId === 'string') {
+      try {
+        await controller().inspect(existing.sessionId)
+        return { sessionId: existing.sessionId, memoryFile: existing.memoryFile ?? memoryFile }
+      } catch {
+        // 分支会话已不存在：重建
+      }
+    }
+    try {
+      await mkdir(memberDirOf(group), { recursive: true })
+      const created = await createSession(group.workspace)
+      try {
+        await controller().rename({ sessionId: created.sessionId, title: `[群] ${group.name} · ${bot.name}` })
+      } catch {
+        // 标题失败不影响使用
+      }
+      const record = { sessionId: created.sessionId, memoryFile, createdAt: Date.now() }
+      group.branches[bot.id] = record
+      try {
+        await appendFile(memoryFile, `# ${bot.name} @ 群「${group.name}」\n\n`, 'utf8')
+      } catch {
+        // 记忆文件写不了不阻塞发言
+      }
+      return record
+    } catch {
+      // 建分支失败：退回复用私聊会话，至少还能发言
+      return { sessionId: bot.sessionId, memoryFile }
+    }
+  }
+
+  /** 把这一轮自己说了什么，写进**自己**的群记忆文件。 */
+  async function rememberInBranch(memoryFile, roundNo, topic, reply) {
+    try {
+      const text = String(reply).replace(/\s+/g, ' ').slice(0, 300)
+      await appendFile(memoryFile, `- [第 ${roundNo} 轮] 议题：${String(topic).slice(0, 80)} → ${text}\n`, 'utf8')
+    } catch {
+      // 记忆写失败不影响发言结果
+    }
+  }
+
+  async function readBranchMemory(memoryFile, maxChars = 1200) {
+    try {
+      const text = await readFile(memoryFile, 'utf8')
+      return text.slice(-maxChars)
+    } catch {
+      return ''
+    }
+  }
+
   /**
    * 叫一位成员发言；空回复/[PASS] 时**重试一次**，仍不行就带回失败原因。
    * 旧实现只写「(未发言)」，看不出是超时、被闸、还是真的没话说。
+   * sessionId 缺省用 Bot 的私聊会话；群聊里传它的**分支会话**。
    */
-  async function askMember(member, buildPrompt, timeoutMs) {
-    const first = await lastSeq(member.sessionId)
+  async function askMember(member, buildPrompt, timeoutMs, sessionId = member.sessionId) {
+    const first = await lastSeq(sessionId)
     try {
-      await promptSession(member.sessionId, buildPrompt())
+      await promptSession(sessionId, buildPrompt())
     } catch (error) {
       return { reply: '', reason: `投递失败：${error && error.message ? error.message : String(error)}` }
     }
-    let reply = (await waitForReply(member.sessionId, first, timeoutMs)).trim()
+    let reply = (await waitForReply(sessionId, first, timeoutMs)).trim()
     if (reply !== '' && !/^\[PASS\]$/i.test(reply)) return { reply, reason: '' }
-    const retryFrom = await lastSeq(member.sessionId)
+    const retryFrom = await lastSeq(sessionId)
     try {
-      await promptSession(member.sessionId, '上一条没有收到你的回应。请只用一两句话直接说你的内容；确实无话可说才回 [PASS]。')
-      reply = (await waitForReply(member.sessionId, retryFrom, Math.min(60_000, timeoutMs))).trim()
+      await promptSession(sessionId, '上一条没有收到你的回应。请只用一两句话直接说你的内容；确实无话可说才回 [PASS]。')
+      reply = (await waitForReply(sessionId, retryFrom, Math.min(60_000, timeoutMs))).trim()
     } catch {
       // 落到下面的失败原因
     }
@@ -1129,6 +1197,20 @@ export function apply(ctx) {
         const roundEntries = [{ who, text }]
         const replies = []
 
+        // 根治：每个 (群 × Bot) 一条专属分支会话 + 一个专属记忆文件。
+        // 分支会话让发言不带私聊历史；记忆文件只属于「这个 Bot 在这个群」。
+        const branches = {}
+        await mutateState(async stateForBranches => {
+          const g = findGroup(stateForBranches, groupKey)
+          if (!g) return
+          for (const member of order) {
+            branches[member.id] = await ensureMemberBranch(stateForBranches, g, member)
+          }
+          return undefined
+        })
+        const branchOf = member =>
+          branches[member.id] ?? { sessionId: member.sessionId, memoryFile: '' }
+
         const finish = async () => {
           await mutateState(s => {
             const g = findGroup(s, groupKey)
@@ -1143,16 +1225,22 @@ export function apply(ctx) {
           // 默认**无上限**：全部成员同时发（用户明确要求）。要限流就传 concurrency > 0。
           const limit = typeof args.concurrency === 'number' && args.concurrency > 0 ? args.concurrency : 0
           const send = async member => {
+              const branch = branchOf(member)
               const lines = []
               lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
               lines.push('本轮是并发讨论：所有成员同时作答，你看不到别人本轮的发言（这是设计），请独立给出你的看法。')
+              const mine = await readBranchMemory(branch.memoryFile)
+              if (mine !== '') {
+                lines.push(`【你在本群的专属记忆（你自己的文件，只有你在这个群里的历史）】\n${mine}`)
+              }
               if (prior.length > 0) {
                 lines.push(`【本轮之前的上下文，仅供参考】\n${prior.map(line => `${line.who}：${line.text}`).join('\n')}`)
               }
               lines.push(`【本议题】\n${who}：${text}`)
               lines.push('直接说你的内容，不要加名字前缀；确实无话可说才回 [PASS]。')
               lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
-              const result = await askMember(member, () => lines.join('\n\n'), 120_000)
+              const result = await askMember(member, () => lines.join('\n\n'), 120_000, branch.sessionId)
+              await rememberInBranch(branch.memoryFile, roundNo, text, result.reply === '' ? `（未发言：${result.reason}）` : result.reply)
               return { member, ...result }
           }
           const results = limit === 0 ? await Promise.all(order.map(send)) : await mapLimit(order, limit, send)
@@ -1173,9 +1261,14 @@ export function apply(ctx) {
         // ── round-robin：成员依次发言，后者能看到前者 ─────────────────
         for (let index = 0; index < order.length; index += 1) {
           const member = order[index]
+          const branch = branchOf(member)
           const lines = []
           lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
           lines.push('成员一次只一个人说话，每条发言都会先发到群里，下一位才开口。不要重复别人已经说过的内容。')
+          const mine = await readBranchMemory(branch.memoryFile)
+          if (mine !== '') {
+            lines.push(`【你在本群的专属记忆（你自己的文件，只有你在这个群里的历史）】\n${mine}`)
+          }
           if (prior.length > 0) {
             lines.push(`【本轮之前的上下文，仅供参考】\n${prior.map(line => `${line.who}：${line.text}`).join('\n')}`)
           }
@@ -1184,7 +1277,8 @@ export function apply(ctx) {
           lines.push(`你是第 ${index + 1} / ${order.length} 位：你之前有 ${index} 位发过言，之后还有 ${order.length - index - 1} 位会看到你的发言。`)
           lines.push('直接说你这一轮要说的内容，不要加名字前缀；如果确实没有要补充的，只回 [PASS]。')
           lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
-          const result = await askMember(member, () => lines.join('\n\n'), 90_000)
+          const result = await askMember(member, () => lines.join('\n\n'), 90_000, branch.sessionId)
+          await rememberInBranch(branch.memoryFile, roundNo, text, result.reply === '' ? `（未发言：${result.reason}）` : result.reply)
           const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
           await mutateState(s => {
             const g = findGroup(s, groupKey)
