@@ -26,7 +26,7 @@
 
 主位判定不靠名字：Bot 记录上有 `main: true`，一个工作区最多一个；切换时自动撤销旧主位，`changed` 会带 `名字#短id`（同名也能分辨）。
 
-## 工具（12 个）
+## 工具（13 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -36,22 +36,34 @@
 | `bot_message` | 给某个 Bot 发消息；**分开报告「已入队」与「对方能否响应」** |
 | `bot_attach` | 把既有 Bot 会话挂进它的工作区分组（仅主 Bot / 用户） |
 | `bot_set_main` | 指定/取消某工作区的主 Bot；同名时按 `id` 精确定位 |
-| `group_create` | 建群，或用 `sessionId` 收养既有会话（仅主 Bot / 用户） |
-| `group_post` / `group_read` | 往群里发 / 读群消息 |
+| `group_create` | 建群（可选 `mode`），或用 `sessionId` 收养既有会话 |
+| `group_post` | 往群里发；`round-robin` 模式下成员按顺序依次发言 |
+| `group_read` | 读群的共享记录（成员看到的是同一条有序对话） |
+| `group_set_mode` | 切换 `broadcast` / `round-robin`（仅主 Bot / 用户） |
 | `memory_remember` / `memory_recall` | 写 / 读某个工作区的记忆 |
 | `session_probe` | 诊断一条会话：inspect / projections / page / resolveAgent / 命令表 |
+
+## 群聊的两种模式
+
+| 模式 | 行为 |
+|---|---|
+| `broadcast`（默认） | 消息投给群会话，只有群会话自己的 agent 回 |
+| `round-robin` | 成员按顺序依次发言：后一位能看到「本轮之前的上下文」与「本轮到目前为止」，并知道自己处在第几位；无话可说回 `[PASS]` |
+
+每条发言都会以一条独立消息写进群会话（`session.append('user/message', …, { surfaceOp:'append' })`），所以打开群对话就能看到逐条记录，且**不会因此多调一次模型**。
 
 ## 斜杠命令
 
 在任意对话里输入 `/`，会看到：
 
 ```
-main   ★ 把这个对话登记为 Bot 并设为主 Bot（已是 Bot 时：再执行一次＝取消）
+main         ★ 把这个对话登记为 Bot 并设为主 Bot（已是 Bot 时：再执行一次＝取消）
+groupmode    ★ 切换本群发言模式：轮流发言（成员互相看见）/ 广播
 ```
 
-- 该会话还不是 Bot ⇒ 就地登记（`id` = 该会话 id，`name` = 会话标题或文件夹名），并设为主 Bot；
-- 已是 Bot ⇒ 切换主位；角色 Bot 执行会被拒绝（不能自封）；
-- 说明：DSH 的命令名不接受非 ASCII，所以命令名只能是 `main`，中文只出现在描述行。
+- `main`：该会话还不是 Bot ⇒ 就地登记（`id` = 该会话 id，`name` = 会话标题或目录名），并设为主 Bot；已是 Bot ⇒ 切换主位；角色 Bot 执行会被拒绝；
+- `groupmode`：只在群会话里有效，执行一次切换一次；
+- 说明：宿主不接受非 ASCII 命令名，所以命令名只能是 `main` / `groupmode`，中文只出现在描述行。
 
 ## 安装
 

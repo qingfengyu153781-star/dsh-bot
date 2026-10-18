@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Workspace-scoped Bots with per-workspace memory and group sessions, for DeepSeek Harness.",
@@ -17,6 +17,8 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
