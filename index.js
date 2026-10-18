@@ -13,7 +13,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, appendFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -52,12 +52,73 @@ function serializeState(task) {
   return run
 }
 
-/** 状态短事务：在锁内 load → mutate → save，避免整对象覆盖丢更新。 */
+// ── 状态读写：内存缓存 + 合并写（高并发关键路径）──────────────────────
+// 旧实现每条发言都 load→save 整份 state.json；成员一多就是 I/O 风暴，
+// 并发轮次互相拖慢。现在：
+//   · 读：进程内缓存，文件 mtime 变了才重新解析（外部手工改仍能生效）；
+//   · 写：150ms 合并写一次（只写最新快照），落盘前不阻塞轮次。
+let CACHED_STATE = null
+let CACHED_MTIME = 0
+let PENDING_SAVE = null
+let SAVE_TIMER = null
+
+async function loadStateCached() {
+  try {
+    const info = await stat(STATE_PATH)
+    if (CACHED_STATE !== null && info.mtimeMs === CACHED_MTIME) return CACHED_STATE
+    CACHED_MTIME = info.mtimeMs
+  } catch {
+    // 文件还不存在：照常解析（会在下面回落成空状态）
+  }
+  const fresh = await loadState()
+  CACHED_STATE = fresh
+  return fresh
+}
+
+function saveStateSoon(state) {
+  CACHED_STATE = state
+  PENDING_SAVE = state
+  if (SAVE_TIMER !== null) return
+  SAVE_TIMER = setTimeout(() => {
+    SAVE_TIMER = null
+    const snapshot = PENDING_SAVE
+    PENDING_SAVE = null
+    if (snapshot === null) return
+    saveState(snapshot)
+      .then(async () => {
+        try {
+          CACHED_MTIME = (await stat(STATE_PATH)).mtimeMs
+        } catch {
+          CACHED_MTIME = 0
+        }
+      })
+      .catch(() => {})
+  }, 150)
+}
+
+/** 需要"写完再返回"的场合（例如工具返回前）显式刷盘。 */
+async function flushStateWrites() {
+  if (SAVE_TIMER !== null) {
+    clearTimeout(SAVE_TIMER)
+    SAVE_TIMER = null
+  }
+  const snapshot = PENDING_SAVE
+  PENDING_SAVE = null
+  if (snapshot === null) return
+  await saveState(snapshot)
+  try {
+    CACHED_MTIME = (await stat(STATE_PATH)).mtimeMs
+  } catch {
+    CACHED_MTIME = 0
+  }
+}
+
+/** 状态短事务：在锁内 读缓存 → mutate → 合并写。 */
 async function mutateState(mutator) {
   return serializeState(async () => {
-    const state = await loadState()
+    const state = await loadStateCached()
     const value = await mutator(state)
-    await saveState(state)
+    saveStateSoon(state)
     return value
   })
 }
@@ -488,14 +549,17 @@ export function apply(ctx) {
       }
       return { ended, parts }
     }
+    const startedAt = Date.now()
     while (Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 1500))
+      // 自适应轮询：前 5 秒密一点（成员常常几秒就答完），之后放稀，减少无谓读取。
+      const elapsed = Date.now() - startedAt
+      await new Promise(resolve => setTimeout(resolve, elapsed < 5000 ? 300 : 900))
       const { ended, parts } = await readOnce()
       if (parts.length > 0) text = parts.join('\n').trim()
       if (!ended) continue
       // 已结束：最多再补读 4 次（约 6 秒）等文本落盘
       for (let extra = 0; extra < 4 && text === ''; extra += 1) {
-        await new Promise(resolve => setTimeout(resolve, 1500))
+        await new Promise(resolve => setTimeout(resolve, 1200))
         const again = await readOnce()
         if (again.parts.length > 0) text = again.parts.join('\n').trim()
       }
@@ -570,6 +634,22 @@ export function apply(ctx) {
     }
     const admin = pool.find(bot => bot.id === group.admin) ?? pool[0]
     return admin === undefined ? pool : [admin, ...pool.filter(bot => bot.id !== admin.id)]
+  }
+
+  /** 有界并发：parallel 一次发太多会把宿主/供应商打满，默认限 8 路。 */
+  async function mapLimit(items, limit, worker) {
+    const results = new Array(items.length)
+    let cursor = 0
+    const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+      while (true) {
+        const index = cursor
+        cursor += 1
+        if (index >= items.length) return
+        results[index] = await worker(items[index], index)
+      }
+    })
+    await Promise.all(runners)
+    return results
   }
 
   /**
@@ -1059,8 +1139,8 @@ export function apply(ctx) {
 
         // ── parallel：同一议题一次发给所有人，并发等待，互不阻塞 ────────
         if (mode === 'parallel') {
-          const results = await Promise.all(
-            order.map(async member => {
+          // 有界并发（8 路）：一次把几百个成员同时打出去会压垮宿主与供应商。
+          const results = await mapLimit(order, 8, async member => {
               const lines = []
               lines.push(`你是「${group.name}」这个群聊的成员：${member.name}。群成员：${order.map(bot => bot.name).join('、')}。`)
               lines.push('本轮是并发讨论：所有成员同时作答，你看不到别人本轮的发言（这是设计），请独立给出你的看法。')
@@ -1072,8 +1152,7 @@ export function apply(ctx) {
               lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
               const result = await askMember(member, () => lines.join('\n\n'), 120_000)
               return { member, ...result }
-            }),
-          )
+          })
           for (const result of results) {
             const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
             await mutateState(s => {
