@@ -208,6 +208,7 @@ export function apply(ctx) {
     const request = workspaceId !== undefined ? { workspaceId } : { cwd: workspacePath }
     if (typeof agentPreset === 'string' && agentPreset !== '') request.agentPreset = agentPreset
     const created = await controller().create(request)
+    await ensureUnarchived(created.sessionId)
     if (workspaceId !== undefined) {
       try {
         const registry = ctx.get('workspaceRegistry')
@@ -330,7 +331,24 @@ export function apply(ctx) {
     // 命令注册失败不影响工具
   }
   /** 在一个会话里放入一条用户消息，并唤醒它。 */
+
+  /**
+   * 归档闸（实测根因）：DSH 的 ArchivedSessionGate 会对**已归档会话**的每一步
+   * 直接 reject ⇒ 轮次以 `blocked` 结束、模型根本不发请求。
+   * 现象就是"消息投进去了，但对方永远不回"。所以投递/建会话前先取消归档（幂等）。
+   */
+  async function ensureUnarchived(sessionId) {
+    try {
+      const registry = ctx.get('workspaceRegistry')
+      if (registry !== undefined && typeof registry.unarchiveSession === 'function') {
+        await registry.unarchiveSession({ sessionId })
+      }
+    } catch {
+      // 没有该能力或本来就没归档：忽略
+    }
+  }
   async function promptSession(sessionId, text) {
+    await ensureUnarchived(sessionId)
     // prompt 是 Remote 方法，必须带一个取消信号（否则内部 signal.throwIfAborted() 会崩）
     await controller().prompt(
       {
