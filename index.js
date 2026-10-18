@@ -1069,6 +1069,7 @@ export function apply(ctx) {
               }
               lines.push(`【本议题】\n${who}：${text}`)
               lines.push('直接说你的内容，不要加名字前缀；确实无话可说才回 [PASS]。')
+              lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
               const result = await askMember(member, () => lines.join('\n\n'), 120_000)
               return { member, ...result }
             }),
@@ -1100,6 +1101,7 @@ export function apply(ctx) {
           lines.push(`本轮发言顺序：${order.map(bot => bot.name).join(' → ')}。`)
           lines.push(`你是第 ${index + 1} / ${order.length} 位：你之前有 ${index} 位发过言，之后还有 ${order.length - index - 1} 位会看到你的发言。`)
           lines.push('直接说你这一轮要说的内容，不要加名字前缀；如果确实没有要补充的，只回 [PASS]。')
+          lines.push('语言：与用户此条消息同一种语言（用户用中文就用中文），不要自行切换成英文。')
           const result = await askMember(member, () => lines.join('\n\n'), 90_000)
           const body = result.reply === '' ? `(未发言：${result.reason})` : result.reply
           await mutateState(s => {
