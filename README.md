@@ -26,7 +26,7 @@
 
 主位判定不靠名字：Bot 记录上有 `main: true`，一个工作区最多一个；切换时自动撤销旧主位，`changed` 会带 `名字#短id`（同名也能分辨）。
 
-## 工具（15 个）
+## 工具（17 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -44,6 +44,8 @@
 | `session_probe` | 诊断一条会话：inspect / projections / page / resolveAgent / 命令表 |
 | `ws_index_show` | 只读回显「注入到系统提示里的工作区索引块」，以及命中的文件/大小/mtime |
 | `ws_index_set` | 写（`replace`）或追加（`append`）工作区索引文件；写完立刻生效 |
+| `bot_memory_show` | 只读回显**某个 Bot** 的专属记忆块（身份 + 指令 + 正文） |
+| `bot_memory_set` | 写某个 Bot 的专属记忆文件；只有它自己的会话能看到 |
 
 ## 工作区索引记忆（ws-index，0.4.1 新增）
 
@@ -71,6 +73,38 @@
         indexOrder: 7000                   # 系统提示里的排序
         allowUnregisteredWorkspace: false  # 见「安全边界」
 ```
+
+## Bot 专属记忆（bot-memory，0.4.2 新增）
+
+**不同的 Bot 拿到不同的记忆**，而不是全工作区共用一份。
+
+| 层 | 文件 | 谁看得到 |
+|---|---|---|
+| 工作区索引（ws-index） | `<workspace>/.dsh-bot/WS_INDEX.md` | 该工作区**所有会话**（含用户会话） |
+| **Bot 专属记忆（bot-memory）** | `<workspace>/.dsh-bot/bots/<bot名>.md` | **只有这个 Bot 自己的会话** |
+
+两者可同时注入：Bot 会话里是「工作区块 + 自己那块」，用户会话里只有工作区块。
+
+**归属判定**与 `callerBot()` 同口径（主会话 / `bot_open` 旧会话 / 群分支会话），
+所以同一个 Bot 换过几次会话，记忆都跟着它走。
+
+注入内容（`<!-- bot-memory:v1 -->` 标记块）：
+
+- 身份行：`名字（角色）· 主 Bot`
+- 工作区与该 Bot 的记忆文件路径、体积
+- **常驻指令**：`bot.instructions`（此前只在登记里躺着，从没进过提示词）
+- 记忆正文（默认上限 4096 B，超了按 UTF-8 边界截断）
+
+配置：
+
+```yaml
+config:
+  botMemoryEnabled: true               # false = 不注入 Bot 专属块
+  botMemoryDir: .dsh-bot/bots          # 相对 workspace
+  botMemoryMaxBytes: 4096
+```
+
+配套工具：`bot_memory_show`（只读回显某个 Bot 的注入块）、`bot_memory_set`（写入/追加）。
 
 ## 群聊的两种模式
 
@@ -136,7 +170,7 @@ groupmode    ★ 切换本群发言模式：轮流发言（成员互相看见）
 | 项 | 口径 |
 |---|---|
 | **身份识别**（P1） | `callerBot()` 认三个来源：`bot.sessionId`（当前主会话）、`bot.history[]`（`bot_open` 之后的旧会话）、`group.branches[botId].sessionId`（群分支会话）。三个都不是的会话按「用户」放行——因为用户自己的会话也不在 Bot 登记里，默认拒绝会误伤用户。 |
-| **工作区闸** | `bot_create` / `group_create` / `workspace_memory_remember` / `ws_index_set` 只接受**已登记工作区**或**本会话 cwd 及其子目录**；其余拒绝并提示两条出路。要越界必须显式 `allowUnregisteredWorkspace: true`。 |
+| **工作区闸** | `bot_create` / `group_create` / `workspace_memory_remember` / `ws_index_set` / `bot_memory_set` 只接受**已登记工作区**或**本会话 cwd 及其子目录**；其余拒绝并提示两条出路。要越界必须显式 `allowUnregisteredWorkspace: true`。 |
 | **收养去重** | `group_create` 带 `sessionId` 时，若该会话已属于别的群则拒绝——一个会话只能属于一个群。 |
 | **投递失败分类** | 群成员会话被占（`already owned` / `writer-held`）判**可重试**：投递层退避重投 3 次，本轮末尾再补投一次；其他错误判**永久失败**，不重投。 |
 | **群轮次落盘** | 每轮结束先 `flushStateWrites()` 再释放群队列，避免下一轮读到 150ms 合并写之前的旧快照（丢 `log`/`rounds`）。 |
@@ -146,6 +180,7 @@ groupmode    ★ 切换本群发言模式：轮流发言（成员互相看见）
 ```sh
 node test/group_queue.test.mjs
 node test/test_ws_index.mjs        # 28 项
+node test/test_bot_memory.mjs      # 25 项（Bot 专属记忆：隔离 / 归属 / 工具）
 node test/test_perm_matrix.mjs     # 14 项
 node test/test_ws_scope_retry.mjs  #  9 项
 ```

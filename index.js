@@ -408,6 +408,98 @@ function wsIndexRender(entry, cwd, maxBytes) {
   return lines.join('\n')
 }
 
+
+// ── Bot 专属记忆（bot-memory）：按会话归属注入 ───────────────────────────
+// 需求（用户 2026-10-22）：不同的 Bot 要能拿到**不同的**记忆，而不是全工作区共用一份。
+//
+// 与 ws-index 的分工：
+//   ws-index    = 工作区级，该工作区**所有会话**都注入（共享的事实与入口）
+//   bot-memory  = Bot 级，只有**属于某个 Bot 的会话**才注入（人设 + 该 Bot 的专属记忆）
+// 两者可同时出现；Bot 会话里是「工作区块 + 自己那块」，用户会话里只有工作区块。
+//
+// 归属判定与 callerBot() 同口径（主会话 / history 旧会话 / 群分支会话），
+// 但这里必须**同步**（systemPrompt.context 的 text() 不能 await），所以单独走一次
+// 同步读 state.json，并按 mtime 缓存。
+const BOT_MEMORY_MARKER_OPEN = '<!-- bot-memory:v1 -->'
+const BOT_MEMORY_MARKER_CLOSE = '<!-- /bot-memory:v1 -->'
+const BOT_MEMORY_DEFAULT_REL = join('.dsh-bot', 'bots')
+const BOT_MEMORY_DEFAULT_MAX_BYTES = 4096
+const NEWLINE2 = String.fromCharCode(10) + String.fromCharCode(10)
+
+let BOT_STATE_CACHE = { mtimeMs: -1, bots: [], groups: [] }
+
+function botFileName(value) {
+  return String(value ?? '').replace(/[\/:*?"<>|]/g, '_') || 'unnamed'
+}
+
+/** 同步读 state.json（按 mtime 缓存）。读失败就沿用上一次的快照，绝不抛。 */
+function botStateSync() {
+  try {
+    const info = statSync(STATE_PATH)
+    if (BOT_STATE_CACHE.mtimeMs === info.mtimeMs) return BOT_STATE_CACHE
+    const raw = readFileSync(STATE_PATH, 'utf8').replace(/^\uFEFF/u, '')
+    const parsed = JSON.parse(raw)
+    const bots = parsed && typeof parsed.bots === 'object' && parsed.bots !== null ? Object.values(parsed.bots) : []
+    const groups = parsed && typeof parsed.groups === 'object' && parsed.groups !== null ? Object.values(parsed.groups) : []
+    BOT_STATE_CACHE = { mtimeMs: info.mtimeMs, bots, groups }
+    return BOT_STATE_CACHE
+  } catch {
+    return BOT_STATE_CACHE
+  }
+}
+
+/** 会话 → Bot；与 callerBot() 同一口径。认不出就返回 undefined（＝按用户会话处理）。 */
+function botForSessionSync(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  const { bots, groups } = botStateSync()
+  const direct = bots.find(bot => bot.sessionId === sessionId)
+  if (direct !== undefined) return direct
+  const viaHistory = bots.find(bot => Array.isArray(bot.history) && bot.history.includes(sessionId))
+  if (viaHistory !== undefined) return viaHistory
+  for (const group of groups) {
+    const branches = group && group.branches
+    if (branches === null || typeof branches !== 'object') continue
+    for (const [botId, record] of Object.entries(branches)) {
+      if (record && record.sessionId === sessionId) {
+        const owner = bots.find(bot => bot.id === botId)
+        if (owner !== undefined) return owner
+      }
+    }
+  }
+  return undefined
+}
+
+function botMemoryFile(workspace, rel, botName) {
+  return join(workspace, rel, `${botFileName(botName)}.md`)
+}
+
+/** 渲染「这个 Bot 的」记忆块。读不到文件也要出块：人设与指令本来就该在。 */
+function botMemoryRender(bot, workspace, rel, maxBytes) {
+  const file = botMemoryFile(workspace, rel, bot.name)
+  const entry = wsIndexRead(file)
+  const lines = [
+    BOT_MEMORY_MARKER_OPEN,
+    `## 你的专属记忆（Bot：${bot.name}）`,
+    '',
+    `- 身份：${bot.name}${bot.role ? `（${bot.role}）` : ''}${bot.main === true ? ' · 主 Bot' : ''}`,
+    `- 工作区：${workspace}`,
+    `- 记忆文件：${file}${entry.ok === true ? `（${(entry.size / 1024).toFixed(1)} KB）` : '（尚未建立）'}`,
+    '- 口径：这份记忆**只属于你**，同工作区的其他 Bot 与用户会话看不到它。',
+  ]
+  if (typeof bot.instructions === 'string' && bot.instructions.trim() !== '') {
+    lines.push('', '### 你的常驻指令', '', bot.instructions.trim())
+  }
+  if (entry.ok === true && entry.body !== '') {
+    const { text, truncated, dropped } = wsIndexTruncate(entry.body, maxBytes)
+    lines.push('', '### 记忆正文', '', text)
+    if (truncated) lines.push('', `…（超过 ${maxBytes} 字节，已截断 ${dropped} 字节；完整内容读上面的文件）`)
+  } else if (entry.ok !== true) {
+    lines.push('', '（还没有专属记忆文件；需要时用 bot_memory_set 写一份。）')
+  }
+  lines.push(BOT_MEMORY_MARKER_CLOSE)
+  return lines.join('\n')
+}
+
 function wsIndexSettings(config) {
   const raw = config !== null && typeof config === 'object' ? config : {}
   const enabled = raw.indexEnabled !== false
@@ -418,7 +510,12 @@ function wsIndexSettings(config) {
   const order = Number.isFinite(orderRaw) ? orderRaw : 7000
   // 审计 issue #1 第 3 条：默认**不**允许把记忆写到未登记工作区（旧行为是任意绝对路径都放行）。
   const allowUnregisteredWorkspace = raw.allowUnregisteredWorkspace === true
-  return { enabled, rel, maxBytes, order, allowUnregisteredWorkspace }
+  // Bot 专属记忆（2026-10-22）：默认开；每个 Bot 一份文件，只有它自己的会话注入。
+  const botMemoryEnabled = raw.botMemoryEnabled !== false
+  const botRel = typeof raw.botMemoryDir === 'string' && raw.botMemoryDir.trim() !== '' ? raw.botMemoryDir.trim() : BOT_MEMORY_DEFAULT_REL
+  const botMaxRaw = Number(raw.botMemoryMaxBytes)
+  const botMaxBytes = Number.isFinite(botMaxRaw) && botMaxRaw >= 256 ? Math.min(65536, Math.floor(botMaxRaw)) : BOT_MEMORY_DEFAULT_MAX_BYTES
+  return { enabled, rel, maxBytes, order, allowUnregisteredWorkspace, botMemoryEnabled, botRel, botMaxBytes }
 }
 
 /** 注册装配期上下文贡献。任何一步失败都只留日志，不让插件停在 pending。 */
@@ -450,14 +547,25 @@ function wsIndexMount(ctx, settings) {
                 try {
                   const cwd = wsIndexCwdOfAssembly(assemblyCtx)
                   if (cwd === '') return ''
+                  const blocks = []
+                  // ① 工作区块：该工作区**所有会话**共享
                   const file = wsIndexLocate(cwd, settings.rel)
-                  if (file === undefined) return ''
-                  const entry = wsIndexRead(file)
-                  if (entry.ok !== true) {
-                    wsIndexNote(`读取失败 ${file}: ${entry.reason}`)
-                    return ''
+                  if (file !== undefined) {
+                    const entry = wsIndexRead(file)
+                    if (entry.ok === true) blocks.push(wsIndexRender(entry, cwd, settings.maxBytes))
+                    else wsIndexNote(`读取失败 ${file}: ${entry.reason}`)
                   }
-                  return wsIndexRender(entry, cwd, settings.maxBytes)
+                  // ② Bot 专属块：只有**属于某个 Bot 的会话**才注入（用户会话拿不到别人的记忆）
+                  if (settings.botMemoryEnabled === true) {
+                    const sessionId = assemblyCtx && assemblyCtx.agent ? assemblyCtx.agent.id : undefined
+                    const bot = botForSessionSync(sessionId)
+                    if (bot !== undefined) {
+                      // Bot 的工作区以登记为准：cwd 可能被 cd 走，登记才是真相
+                      const botWs = typeof bot.workspace === 'string' && bot.workspace !== '' ? bot.workspace : cwd
+                      blocks.push(botMemoryRender(bot, botWs, settings.botRel, settings.botMaxBytes))
+                    }
+                  }
+                  return blocks.join(NEWLINE2)
                 } catch (error) {
                   wsIndexNote(`渲染异常: ${error?.message ?? error}`)
                   return ''
@@ -2005,6 +2113,119 @@ export function apply(ctx, config = {}) {
       return ok(
         `${mode === 'append' ? '已追加' : '已写入'}：${file}（${size} B）。下一轮装配起自动注入。` +
           (over ? `\n⚠ 已超过注入上限 ${indexSettings.maxBytes} B，注入时会被截断；建议把正文挪到别的文件、这里只留索引。` : ''),
+      )
+    },
+  })
+
+  tool({
+    name: 'bot_memory_show',
+    description:
+      "Read-only: show ONE Bot's private memory block exactly as it is injected into that Bot's own sessions (identity + standing instructions + memory body). Omit bot to resolve it from the calling session.",
+    parameters: {
+      type: 'object',
+      properties: {
+        bot: { type: 'string', description: 'Bot name or id. Omit to resolve the Bot that owns the calling session.' },
+        workspace: { type: 'string', description: "Bot's workspace; defaults to the resolved Bot's registered workspace." },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args, exec) {
+      const state = await loadStateInPlugin()
+      const key = typeof args.bot === 'string' && args.bot.trim() !== '' ? args.bot.trim() : undefined
+      let bot
+      if (key !== undefined) {
+        const all = Object.values(state.bots ?? {})
+        const byIdentity = all.filter(item => item.id === key || item.sessionId === key)
+        const matches = byIdentity.length > 0 ? byIdentity : all.filter(item => item.name === key)
+        if (matches.length === 0) return fail(`找不到这个 Bot：${key}`)
+        if (matches.length > 1) {
+          return fail(`同名 ${key} 有 ${matches.length} 个，请改用 id 或 sessionId：${matches.map(item => `${item.name} id=${item.id}`).join('；')}`)
+        }
+        bot = matches[0]
+      } else {
+        const sessionId = exec && exec.agent ? exec.agent.id : undefined
+        bot = botForSessionSync(sessionId)
+        if (bot === undefined) {
+          return fail('本会话不属于任何 Bot（用户会话拿不到 Bot 的专属记忆）。请显式传 bot 参数。')
+        }
+      }
+      const ws = typeof args.workspace === 'string' && args.workspace.trim() !== '' ? args.workspace.trim() : String(bot.workspace ?? '')
+      if (ws === '') return fail(`Bot ${bot.name} 没有登记工作区。`)
+      const file = botMemoryFile(ws, indexSettings.botRel, bot.name)
+      const entry = wsIndexRead(file)
+      return ok(
+        [
+          `Bot：${bot.name}${bot.role ? `（${bot.role}）` : ''}${bot.main === true ? ' · 主 Bot' : ''}`,
+          `记忆文件：${file}${entry.ok === true ? `（${entry.size} B / 注入上限 ${indexSettings.botMaxBytes} B）` : '（不存在）'}`,
+          `注入开关：${indexSettings.botMemoryEnabled ? '已启用' : '已停用（botMemoryEnabled=false）'}`,
+          '',
+          botMemoryRender(bot, ws, indexSettings.botRel, indexSettings.botMaxBytes),
+        ].join('\n'),
+      )
+    },
+  })
+
+  tool({
+    name: 'bot_memory_set',
+    description:
+      "Write (replace or append) ONE Bot's private memory file at <workspace>/.dsh-bot/bots/<bot>.md. Only that Bot's own sessions get it injected; other Bots and user sessions never see it.",
+    parameters: {
+      type: 'object',
+      properties: {
+        bot: { type: 'string', description: 'Bot name or id.' },
+        content: { type: 'string', description: 'Markdown to write.' },
+        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) overwrites; append adds after the existing body.' },
+        workspace: { type: 'string', description: "Bot's workspace; defaults to the Bot's registered workspace." },
+      },
+      required: ['bot', 'content'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args, exec) {
+      const state = await loadStateInPlugin()
+      const key = String(args.bot ?? '').trim()
+      if (key === '') return fail('bot 不能为空。')
+      if (typeof args.content !== 'string' || args.content.trim() === '') return fail('content 不能为空。')
+      const all = Object.values(state.bots ?? {})
+      const byIdentity = all.filter(item => item.id === key || item.sessionId === key)
+      const matches = byIdentity.length > 0 ? byIdentity : all.filter(item => item.name === key)
+      if (matches.length === 0) return fail(`找不到这个 Bot：${key}`)
+      if (matches.length > 1) {
+        return fail(`同名 ${key} 有 ${matches.length} 个，请改用 id 或 sessionId：${matches.map(item => `${item.name} id=${item.id}`).join('；')}`)
+      }
+      const bot = matches[0]
+      const ws = typeof args.workspace === 'string' && args.workspace.trim() !== ''
+        ? await assertWorkspaceScope(args.workspace, exec, 'workspace')
+        : String(bot.workspace ?? '')
+      if (ws === '') return fail(`Bot ${bot.name} 没有登记工作区，请显式传 workspace。`)
+      const file = botMemoryFile(ws, indexSettings.botRel, bot.name)
+      const mode = args.mode === 'append' ? 'append' : 'replace'
+      try {
+        await mkdir(dirname(file), { recursive: true })
+        if (mode === 'append') {
+          let prev = ''
+          try {
+            prev = await readFile(file, 'utf8')
+          } catch {
+            prev = ''
+          }
+          const head = prev.trim() === '' ? `# ${bot.name} 的专属记忆` + NEWLINE2 : prev.replace(/\s*$/u, '\n')
+          await writeFile(file, `${head}\n${args.content.replace(/\r\n/g, '\n').trim()}\n`, 'utf8')
+        } else {
+          await writeFile(file, `${args.content.replace(/\r\n/g, '\n').trim()}\n`, 'utf8')
+        }
+      } catch (error) {
+        return fail(`写入失败：${error?.message ?? error}`)
+      }
+      WS_INDEX_CACHE.delete(file)
+      const entry = wsIndexRead(file)
+      const size = entry.ok === true ? entry.size : 0
+      const over = size > indexSettings.botMaxBytes
+      return ok(
+        `${mode === 'append' ? '已追加' : '已写入'}：${file}（${size} B）。` +
+          `下一轮装配起，只有 **${bot.name}** 自己的会话会看到这段；其他 Bot 与用户会话看不到。` +
+          (over ? `\n⚠ 已超过注入上限 ${indexSettings.botMaxBytes} B，注入时会被截断。` : ''),
       )
     },
   })

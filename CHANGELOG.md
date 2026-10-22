@@ -1,3 +1,57 @@
+# 更新报告 · @local/dsh-bot 0.4.2（2026-10-22）
+
+新增 **Bot 专属记忆（bot-memory）**：不同的 Bot 拿到不同的记忆。
+
+## 一、为什么
+
+0.4.1 的 ws-index 是**工作区级**——同一个工作区里所有会话（主 Bot、各角色 Bot、用户自己）拿到的是同一份索引。
+但 Bot 是分工的：侦察有侦察的线索，实施有实施的进度，审计有审计的疑点。
+让它们共用一份记忆，等于把三条工作线搅在一起。
+
+## 二、怎么分
+
+| 层 | 文件 | 谁看得到 |
+|---|---|---|
+| ws-index | `<workspace>/.dsh-bot/WS_INDEX.md` | 该工作区**所有会话** |
+| **bot-memory** | `<workspace>/.dsh-bot/bots/<bot名>.md` | **只有这个 Bot 自己的会话** |
+
+Bot 会话里注入「工作区块 + 自己那块」；用户会话只有工作区块，看不到任何 Bot 的私有记忆。
+
+**归属判定**与 `callerBot()` 同口径：`bot.sessionId`（当前主会话）、`bot.history[]`（`bot_open` 旧会话）、
+`group.branches[botId].sessionId`（群分支会话）。同一个 Bot 换过几次会话，记忆都跟着它走。
+
+## 三、顺带把 instructions 接上了
+
+`bot.instructions` 此前只存在登记里，**从没进过提示词**（0.4.1 README 的「边界」里写着这条）。
+现在作为「你的常驻指令」注入该 Bot 自己的会话，角色人设终于生效。
+
+## 四、新增两个工具
+
+| 工具 | 作用 |
+|---|---|
+| `bot_memory_show` | 只读回显某个 Bot 的注入块；省略 `bot` 参数则按调用会话反查（用户会话会被拒） |
+| `bot_memory_set` | 写/追加某个 Bot 的专属记忆；走工作区闸，返回里明确「只有这个 Bot 看得到」 |
+
+## 五、实现要点
+
+- `systemPrompt.context` 的 `text()` 必须**同步**，所以单独做了一次同步读 `state.json`（按 mtime 缓存），
+  与 `callerBot()` 的异步路径分开，避免把 `await` 引进每轮装配。
+- 读失败 / state 缺失 / 会话认不出 → 一律**不抛**，最差只是没有 Bot 块。
+- Bot 的工作区以**登记**为准（cwd 可能被 `cd` 走）。
+
+## 六、测试
+
+```sh
+node test/test_bot_memory.mjs      # 25 项
+```
+
+覆盖：两个 Bot 互相看不到 / 用户会话拿不到 / 人设与 instructions / history 与群分支归属 /
+无 ws-index 时 Bot 块仍在 / 两块共存且顺序稳定 / 工具读写 / 关闭开关 / 坏输入不抛。
+
+全套 76 项 + 上游 11 项全绿。
+
+---
+
 # 更新报告 · @local/dsh-bot 0.4.1（2026-10-22）
 
 回应外部审计 [issue #1](https://github.com/qingfengyu153781-star/dsh-bot/issues/1)（等级三深度审计）。
