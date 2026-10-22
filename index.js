@@ -13,9 +13,10 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { appendFileSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile, appendFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const name = '@local/dsh-bot'
 export const inject = ['tools']
@@ -216,8 +217,7 @@ function assertUsablePath(value, label) {
 function findBot(state, key) {
   if (!key) return undefined
   const byName = Object.values(state.bots).find(bot => bot.name === key)
-  return byName ?? state.bots[key]
-}
+  return byName ?? state.bots[key]}
 
 function findGroup(state, key) {
   if (!key) return undefined
@@ -225,10 +225,38 @@ function findGroup(state, key) {
   return byName ?? state.groups[key]
 }
 
+/**
+ * 认「这条会话属于哪个 Bot」。
+ *
+ * ⚠ 2026-10-22 修 P1（外部审计 issue #1 实测）：旧实现只比对 `bot.sessionId`，
+ * 于是凡是不等于**当前主会话**的会话都被当成「用户」，main 闸门被绕过。两个真实入口：
+ *   ① 群成员分支会话（`[群] 群名 · Bot名`）：角色 Bot 从那里调 bot_set_main 自封主位成功；
+ *   ② `bot_open` 之后的旧会话：旧 id 进了 `bot.history`，但旧实现不查 history —— 不需要群也能绕过。
+ * 现在三个来源全查（都是**已有数据**，不新增状态）：
+ *   bot.sessionId（当前主会话）· bot.history[]（开新对话后的旧会话）· group.branches[botId]（群分支会话）。
+ *
+ * 为什么不做「认不出就按角色 Bot 拒绝」：用户自己的会话同样不在任何 Bot 登记里，
+ * 默认拒绝会把用户一起挡掉（bot_create / bot_set_main 从用户会话就再也调不通）。
+ */
 function callerBot(state, exec) {
   const sessionId = exec && exec.agent ? exec.agent.id : undefined
   if (!sessionId) return undefined
-  return Object.values(state.bots).find(bot => bot.sessionId === sessionId)
+  const bots = Object.values(state.bots ?? {})
+  const direct = bots.find(bot => bot.sessionId === sessionId)
+  if (direct !== undefined) return direct
+  const viaHistory = bots.find(bot => Array.isArray(bot.history) && bot.history.includes(sessionId))
+  if (viaHistory !== undefined) return viaHistory
+  for (const group of Object.values(state.groups ?? {})) {
+    const branches = group && group.branches
+    if (branches === null || typeof branches !== 'object') continue
+    for (const [botId, record] of Object.entries(branches)) {
+      if (record && record.sessionId === sessionId) {
+        const owner = state.bots?.[botId] ?? bots.find(bot => bot.id === botId)
+        if (owner !== undefined) return owner
+      }
+    }
+  }
+  return undefined
 }
 
 function briefBot(bot) {
@@ -239,7 +267,219 @@ function briefBot(bot) {
   return bits.join(' ')
 }
 
-export function apply(ctx) {
+// ── 工作区索引记忆（WS_INDEX）：每轮自动注入 ─────────────────────────────
+// 需求（用户 2026-10-22）：给一个工作区设定一份「索引记忆文件」，该工作区的**每个会话
+// 每一轮**都自动带上它，不必每次让模型自己去翻。
+//
+// 四条硬约束，每条都对应一个会真实发生的坏结果：
+//   1) 走 `systemPrompt.context`（每轮装配时取一次），不用 `section`（注册时内容就固定，
+//      改了文件下一轮不会变）。arbiter 的实测注释写明：context 的 `text(ctx)` 是**同步**的。
+//   2) `text()` 必须**永不抛**：它在每个会话的每一步装配里都跑，抛一次就毁掉本工作区所有会话。
+//      所以文件缺失 / 读失败 / 编码坏 / 渲染异常，一律返回空串 + 留一条日志。
+//   3) 只注入「索引 + 指向原文的路径」，正文按需读。索引涨到 1 MB 也不挤上下文（有字节上限）。
+//   4) 索引文件**不叫** AGENTS.md / CLAUDE.md：那两个名字由宿主自己的 agent-instructions 注入，
+//      插件再注入一遍就是同一段话出现两遍（而且改一处另一处不会同步）。
+const WS_INDEX_MARKER_OPEN = '<!-- ws-index:v1 -->'
+const WS_INDEX_MARKER_CLOSE = '<!-- /ws-index:v1 -->'
+const WS_INDEX_DEFAULT_REL = join('.dsh-bot', 'WS_INDEX.md')
+const WS_INDEX_DEFAULT_MAX_BYTES = 8192
+const WS_INDEX_MAX_WALK = 12
+const WS_INDEX_HOST_OWNED = new Set(['agents.md', 'claude.md'])
+/** 文件路径 -> { mtimeMs, size, body }；只缓存正文，渲染按会话现拼（很便宜）。 */
+const WS_INDEX_CACHE = new Map()
+
+function wsIndexNote(line) {
+  try {
+    const file = join(STATE_DIR, 'ws-index.log')
+    let size = 0
+    try {
+      size = statSync(file).size
+    } catch {
+      size = 0
+    }
+    if (size > 64 * 1024) writeFileSync(file, '', 'utf8') // 有界：不让日志长成第二个数据库
+    appendFileSync(file, `[${new Date().toISOString()}] ${line}\n`, 'utf8')
+  } catch {
+    // 日志写不进去也绝不能影响注入
+  }
+}
+
+/** 会话工作目录：优先 session.header.cwd（宿主建会话时写入的真相），其次 agent.cwd。 */
+function wsIndexAgentCwd(agent) {
+  if (agent === undefined || agent === null) return ''
+  const session = agent.session ?? (typeof agent.getSession === 'function' ? agent.getSession() : undefined)
+  const fromHeader = session && session.header && typeof session.header.cwd === 'string' ? session.header.cwd : ''
+  if (fromHeader !== '') return fromHeader
+  return typeof agent.cwd === 'string' ? agent.cwd : ''
+}
+
+function wsIndexCwdOfAssembly(assemblyCtx) {
+  return wsIndexAgentCwd(assemblyCtx && assemblyCtx.agent)
+}
+
+/**
+ * 从 cwd 向上找**最近**的一份索引文件。
+ * 这样「工作区子目录里开的会话」也会归属到所在工作区，而不是各写一份。
+ */
+function wsIndexLocate(cwd, rel) {
+  if (typeof cwd !== 'string' || cwd === '') return undefined
+  if (isAbsolute(rel)) {
+    try {
+      return statSync(rel).isFile() ? rel : undefined
+    } catch {
+      return undefined
+    }
+  }
+  let dir = resolve(cwd)
+  for (let step = 0; step < WS_INDEX_MAX_WALK; step += 1) {
+    const candidate = join(dir, rel)
+    try {
+      if (statSync(candidate).isFile()) return candidate
+    } catch {
+      // 这一层没有，继续向上
+    }
+    const parent = dirname(dir)
+    if (parent === dir || parent === '') break
+    dir = parent
+  }
+  return undefined
+}
+
+/** 同步读 + 按 (mtime, size) 缓存：每轮只 stat 一次，内容没变就不重读。 */
+function wsIndexRead(file) {
+  let info
+  try {
+    info = statSync(file)
+  } catch {
+    return { ok: false, reason: 'missing' }
+  }
+  if (!info.isFile()) return { ok: false, reason: 'not-a-file' }
+  const cached = WS_INDEX_CACHE.get(file)
+  if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached
+  let raw
+  try {
+    raw = readFileSync(file, 'utf8')
+  } catch (error) {
+    return { ok: false, reason: `unreadable: ${error?.message ?? error}` }
+  }
+  const entry = {
+    ok: true,
+    file,
+    mtimeMs: info.mtimeMs,
+    size: info.size,
+    body: raw.replace(/^\uFEFF/u, '').replace(/\r\n/g, '\n').trim(),
+  }
+  WS_INDEX_CACHE.set(file, entry)
+  if (WS_INDEX_CACHE.size > 64) {
+    const first = WS_INDEX_CACHE.keys().next().value
+    if (first !== undefined) WS_INDEX_CACHE.delete(first)
+  }
+  return entry
+}
+
+function wsIndexTruncate(body, maxBytes) {
+  const total = Buffer.byteLength(body, 'utf8')
+  if (total <= maxBytes) return { text: body, truncated: false, dropped: 0 }
+  const cut = Buffer.from(body, 'utf8')
+    .subarray(0, Math.max(0, maxBytes))
+    .toString('utf8')
+    .replace(/\uFFFD+$/u, '') // 别把多字节字符截成半个
+  return { text: cut, truncated: true, dropped: total - Buffer.byteLength(cut, 'utf8') }
+}
+
+function wsIndexRender(entry, cwd, maxBytes) {
+  const { text, truncated, dropped } = wsIndexTruncate(entry.body, maxBytes)
+  const kb = (entry.size / 1024).toFixed(1)
+  const when = new Date(entry.mtimeMs).toISOString().replace(/\.\d{3}Z$/u, 'Z')
+  const lines = [
+    WS_INDEX_MARKER_OPEN,
+    '## 工作区索引记忆（自动注入 · 每轮）',
+    '',
+    `- 工作区：${cwd}`,
+    `- 索引文件：${entry.file}（${kb} KB，更新于 ${when}）`,
+    '- 口径：这是**索引与入口**，不是全文；要细节按下面的路径去读原文，不要凭印象补。',
+    '',
+    text,
+  ]
+  if (truncated) {
+    lines.push('', `…（超过注入上限 ${maxBytes} 字节，已截断 ${dropped} 字节；完整内容请读上面那个文件）`)
+  }
+  lines.push(WS_INDEX_MARKER_CLOSE)
+  return lines.join('\n')
+}
+
+function wsIndexSettings(config) {
+  const raw = config !== null && typeof config === 'object' ? config : {}
+  const enabled = raw.indexEnabled !== false
+  const rel = typeof raw.indexFile === 'string' && raw.indexFile.trim() !== '' ? raw.indexFile.trim() : WS_INDEX_DEFAULT_REL
+  const maxRaw = Number(raw.indexMaxBytes)
+  const maxBytes = Number.isFinite(maxRaw) && maxRaw >= 512 ? Math.min(65536, Math.floor(maxRaw)) : WS_INDEX_DEFAULT_MAX_BYTES
+  const orderRaw = Number(raw.indexOrder)
+  const order = Number.isFinite(orderRaw) ? orderRaw : 7000
+  // 审计 issue #1 第 3 条：默认**不**允许把记忆写到未登记工作区（旧行为是任意绝对路径都放行）。
+  const allowUnregisteredWorkspace = raw.allowUnregisteredWorkspace === true
+  return { enabled, rel, maxBytes, order, allowUnregisteredWorkspace }
+}
+
+/** 注册装配期上下文贡献。任何一步失败都只留日志，不让插件停在 pending。 */
+function wsIndexMount(ctx, settings) {
+  if (settings.enabled !== true) return
+  if (WS_INDEX_HOST_OWNED.has(basename(settings.rel).toLowerCase())) {
+    wsIndexNote(`索引文件名 ${basename(settings.rel)} 归宿主 agent-instructions 管，插件注入已跳过（避免重复）`)
+    return
+  }
+  if (typeof ctx.inject !== 'function') {
+    wsIndexNote('ctx.inject 不可用，ws-index 注入未注册')
+    return
+  }
+  try {
+    ctx.inject(['systemPrompt'], (spCtx) => {
+      const service = spCtx && spCtx.systemPrompt
+      if (service === undefined || service === null || typeof service.context !== 'function') {
+        wsIndexNote('systemPrompt.context 不可用，ws-index 注入未注册')
+        return
+      }
+      try {
+        ctx.effect(() => {
+          try {
+            return service.context({
+              name: 'ws-index:workspace',
+              order: settings.order,
+              // 同步、纯函数式、永不抛：拿不到就返回空串（等于本会话没有这段）
+              text: (assemblyCtx) => {
+                try {
+                  const cwd = wsIndexCwdOfAssembly(assemblyCtx)
+                  if (cwd === '') return ''
+                  const file = wsIndexLocate(cwd, settings.rel)
+                  if (file === undefined) return ''
+                  const entry = wsIndexRead(file)
+                  if (entry.ok !== true) {
+                    wsIndexNote(`读取失败 ${file}: ${entry.reason}`)
+                    return ''
+                  }
+                  return wsIndexRender(entry, cwd, settings.maxBytes)
+                } catch (error) {
+                  wsIndexNote(`渲染异常: ${error?.message ?? error}`)
+                  return ''
+                }
+              },
+            })
+          } catch (error) {
+            wsIndexNote(`context 注册失败: ${error?.message ?? error}`)
+            return () => {}
+          }
+        }, 'ws-index: workspace index injection')
+      } catch (error) {
+        wsIndexNote(`effect 注册失败: ${error?.message ?? error}`)
+      }
+    })
+  } catch (error) {
+    wsIndexNote(`inject(systemPrompt) 失败: ${error?.message ?? error}`)
+  }
+}
+
+
+export function apply(ctx, config = {}) {
   const tool = definition => ctx.tools.register(definition)
 
   /**
@@ -723,25 +963,48 @@ export function apply(ctx) {
    * 叫一位成员发言；空回复/[PASS] 时**重试一次**，仍不行就带回失败原因。
    * 旧实现只写「(未发言)」，看不出是超时、被闸、还是真的没话说。
    * sessionId 缺省用 Bot 的私聊会话；群聊里传它的**分支会话**。
+   *
+   * ⚠ 审计 issue #1 第 4 条：成员会话被上一轮占着时宿主报
+   * `session "…" is already owned by an active turn` / `session/writer-held`，
+   * 旧实现直接整轮失败且没有重试语义。现在按「可重试 / 永久失败」分开：
+   * 占用类错误退避重投（最多 3 次），其余错误立刻判永久失败，并把类别带回调用方。
    */
+  const BUSY_PATTERN = /already owned|writer-held|active turn|active write handle|is busy|正在被占用/i
+
+  /** 投递一条 prompt；返回 { ok, retryable, message }。占用类错误自动退避重投。 */
+  async function deliver(sessionId, text, attempts = 3) {
+    let last = ''
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        await promptSession(sessionId, text)
+        return { ok: true, retryable: false, message: '' }
+      } catch (error) {
+        last = String(error && error.message ? error.message : error)
+        if (!BUSY_PATTERN.test(last)) return { ok: false, retryable: false, message: last }
+        if (attempt < attempts - 1) {
+          await new Promise(resolve => setTimeout(resolve, 800 * (attempt + 1)))
+        }
+      }
+    }
+    return { ok: false, retryable: true, message: last }
+  }
+
   async function askMember(member, buildPrompt, timeoutMs, sessionId = member.sessionId) {
     const first = await lastSeq(sessionId)
-    try {
-      await promptSession(sessionId, buildPrompt())
-    } catch (error) {
-      return { reply: '', reason: `投递失败：${error && error.message ? error.message : String(error)}` }
+    const sent = await deliver(sessionId, buildPrompt())
+    if (!sent.ok) {
+      const kind = sent.retryable ? '可重试' : '永久失败'
+      return { reply: '', reason: `投递失败（${kind}）：${sent.message}`, retryable: sent.retryable }
     }
     let reply = (await waitForReply(sessionId, first, timeoutMs)).trim()
     if (reply !== '' && !/^\[PASS\]$/i.test(reply)) return { reply, reason: '' }
     const retryFrom = await lastSeq(sessionId)
-    try {
-      await promptSession(sessionId, '上一条没有收到你的回应。请只用一两句话直接说你的内容；确实无话可说才回 [PASS]。')
+    const again = await deliver(sessionId, '上一条没有收到你的回应。请只用一两句话直接说你的内容；确实无话可说才回 [PASS]。')
+    if (again.ok) {
       reply = (await waitForReply(sessionId, retryFrom, Math.min(60_000, timeoutMs))).trim()
-    } catch {
-      // 落到下面的失败原因
     }
     if (reply !== '' && !/^\[PASS\]$/i.test(reply)) return { reply, reason: '' }
-    return { reply: '', reason: reply === '' ? '重试一次仍超时/无回应' : '回了 [PASS]' }
+    return { reply: '', reason: reply === '' ? '重试一次仍超时/无回应' : '回了 [PASS]', retryable: false }
   }
 
   tool({
@@ -763,7 +1026,7 @@ export function apply(ctx) {
     },
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
     async execute(args, exec) {
-      assertUsablePath(args.workspace, 'workspace')
+      await assertWorkspaceScope(args.workspace, exec, 'workspace')
       const state = await loadStateInPlugin()
       const caller = callerBot(state, exec)
       if (caller !== undefined && caller.main !== true) {
@@ -1081,7 +1344,7 @@ export function apply(ctx) {
     },
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
     async execute(args, exec) {
-      assertUsablePath(args.workspace, 'workspace')
+      await assertWorkspaceScope(args.workspace, exec, 'workspace')
       const state = await loadStateInPlugin()
       const caller = callerBot(state, exec)
       if (caller !== undefined && caller.main !== true) {
@@ -1101,6 +1364,15 @@ export function apply(ctx) {
       const note = unresolved.length > 0 ? ` Unresolved member names kept as labels: ${unresolved.join(', ')}.` : ''
 
       if (args.sessionId) {
+        // 收养去重（审计 issue #1 第 2 条）：同一会话被两个群同时收养时，state.json 里会出现
+        // 两条同 sessionId 的群记录，之后的 group_post / 成员分支归属就没有唯一答案了。
+        const taken = Object.values(state.groups ?? {}).find(group => group && group.sessionId === args.sessionId)
+        if (taken !== undefined) {
+          return fail(
+            `Session ${args.sessionId} 已经是群「${taken.name}」的会话（群 id ${taken.id ?? taken.sessionId}）。` +
+              `一个会话只能属于一个群；要换群请先删掉旧群登记，或新建一个会话再收养。`,
+          )
+        }
         const info = await controller().inspect(args.sessionId)
         const cwd = info && info.meta ? info.meta.cwd : undefined
         if (cwd && join(cwd).toLowerCase() !== join(args.workspace).toLowerCase()) {
@@ -1211,13 +1483,49 @@ export function apply(ctx) {
         const branchOf = member =>
           branches[member.id] ?? { sessionId: member.sessionId, memoryFile: '' }
 
+        /**
+         * 审计 issue #1 第 4 条：成员会话被占时，旧实现整轮失败且没有重试语义。
+         * 投递层已按「占用类错误」退避重投（见 deliver）；仍失败且判定为**可重试**的成员，
+         * 在本轮末尾按顺序再补投一次，并把结果并回 replies。永久失败的不重投（重投也没用）。
+         */
+        const retryable = []
+        const retryPass = async (pending, lines, entries) => {
+          if (pending.length === 0) return ''
+          const recovered = []
+          for (const item of pending) {
+            const prompt = [
+              '上一轮你的会话正被占用，所以没能发言。请补上你这一轮要说的话；确实没有就回 [PASS]。',
+              '直接说内容，不要加名字前缀；语言与用户此条消息一致。',
+            ].join('\n')
+            const again = await askMember(item.member, () => prompt, 60_000, item.branch.sessionId)
+            if (again.reply !== '') {
+              const body = again.reply
+              await mutateState(s2 => {
+                const g = findGroup(s2, groupKey)
+                if (g) appendLog(g, { who: item.member.name, role: 'bot', text: body, time: Date.now() })
+              })
+              await appendVisibleMessage(group.sessionId, item.member.name, body)
+              entries.push({ who: item.member.name, text: body })
+              const idx = lines.findIndex(line => line.startsWith(`${item.member.name}：`))
+              if (idx >= 0) lines[idx] = `${item.member.name}：${body}`
+              else lines.push(`${item.member.name}：${body}`)
+              recovered.push(item.member.name)
+            }
+          }
+          const still = pending.length - recovered.length
+          const parts = []
+          if (recovered.length > 0) parts.push(`已补投 ${recovered.length} 位（${recovered.join('、')}）`)
+          if (still > 0) parts.push(`${still} 位仍被占用，可稍后重发本轮`)
+          return parts.length > 0 ? `；${parts.join('；')}` : ''
+        }
+
         const finish = async () => {
           await mutateState(s => {
             const g = findGroup(s, groupKey)
             if (g) g.rounds = roundNo
           })
-          // 关键：本轮必须先把 state 落盘再释放群队列；否则下一轮 loadStateInPlugin()
-          // 会读到 150ms 合并写之前的旧快照，丢掉上一轮的 log/rounds（实测 log=5、rounds=1）。
+          // 关键（上游 96a45860）：本轮必须先把 state 落盘再释放群队列；否则下一轮
+          // loadStateInPlugin() 会读到 150ms 合并写之前的旧快照，丢掉上一轮的 log/rounds。
           await flushStateWrites()
           const file = await appendRoundFile(group, roundEntries.map(entry => `${entry.who}：${entry.text}`), roundNo)
           return file
@@ -1256,9 +1564,11 @@ export function apply(ctx) {
             if (result.reply !== '') await appendVisibleMessage(group.sessionId, result.member.name, result.reply)
             roundEntries.push({ who: result.member.name, text: body })
             replies.push(`${result.member.name}：${body}`)
+            if (result.reply === '' && result.retryable === true) retryable.push({ member: result.member, branch: branchOf(result.member) })
           }
           const file = await finish()
-          return ok(`群「${group.name}」本轮结束（parallel 并发 ${order.length} 位${file ? `，已留档 ${file}` : ''}）：\n\n${replies.join('\n\n')}`)
+          const retryNote = await retryPass(retryable, replies, roundEntries)
+          return ok(`群「${group.name}」本轮结束（parallel 并发 ${order.length} 位${file ? `，已留档 ${file}` : ''}${retryNote}）：\n\n${replies.join('\n\n')}`)
         }
 
         // ── round-robin：成员依次发言，后者能看到前者 ─────────────────
@@ -1290,9 +1600,11 @@ export function apply(ctx) {
           if (result.reply !== '') await appendVisibleMessage(group.sessionId, member.name, result.reply)
           roundEntries.push({ who: member.name, text: body })
           replies.push(`${member.name}：${body}`)
+          if (result.reply === '' && result.retryable === true) retryable.push({ member, branch })
         }
         const file = await finish()
-        return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}${file ? `，已留档 ${file}` : ''}）：\n\n${replies.join('\n\n')}`)
+        const retryNote = await retryPass(retryable, replies, roundEntries)
+        return ok(`群「${group.name}」本轮结束（${order.length} 位成员，顺序 ${order.map(bot => bot.name).join(' → ')}${file ? `，已留档 ${file}` : ''}${retryNote}）：\n\n${replies.join('\n\n')}`)
       })
     },
   })
@@ -1495,8 +1807,8 @@ export function apply(ctx) {
       additionalProperties: false,
     },
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
-    async execute(args) {
-      assertUsablePath(args.workspace, 'workspace')
+    async execute(args, exec) {
+      await assertWorkspaceScope(args.workspace, exec, 'workspace')
       const dir = memoryDir(args.workspace)
       await mkdir(join(dir, 'topics'), { recursive: true })
       const stamp = new Date().toISOString()
@@ -1565,6 +1877,135 @@ export function apply(ctx) {
         }
       }
       return ok(chunks.length === 0 ? `(no memory for ${args.workspace})` : chunks.join('\n\n'))
+    },
+  })
+
+  // ── 工作区索引记忆：注入 + 两个配套工具（v0.2 新增）─────────────────────
+  const indexSettings = wsIndexSettings(config)
+  wsIndexMount(ctx, indexSettings)
+
+  /**
+   * 工作区闸（审计 issue #1 第 3 条）：`workspace` 参数此前接受任意绝对路径，
+   * 于是记忆/索引可以写到仓库外任意可写目录（实测写进 %TEMP%/bot-outside/）。
+   * 现在的口径：**已登记工作区**，或**调用方自己会话 cwd 及其子目录**；两者之外一律拒绝。
+   * 明确要越界时，配置 `allowUnregisteredWorkspace: true` 才放行（风险自负，写在 README）。
+   */
+  async function assertWorkspaceScope(path, exec, label = 'workspace') {
+    const text = assertUsablePath(path, label)
+    if (text === '') fail(`${label} 不能为空。`)
+    if (indexSettings.allowUnregisteredWorkspace === true) return text
+    let target
+    try {
+      target = resolve(text)
+    } catch {
+      fail(`${label} 不是合法路径：${text}`)
+    }
+    const registry = ctx.get('workspaceRegistry')
+    if (registry !== undefined && typeof registry.resolveByPath === 'function') {
+      try {
+        if ((await registry.resolveByPath(target)) !== undefined) return text
+      } catch {
+        // 查不动登记表就继续按 cwd 判，不因查表失败而放行
+      }
+    }
+    const cwd = wsIndexAgentCwd(exec && exec.agent)
+    if (cwd !== '') {
+      const base = resolve(cwd).replace(/[\\/]+$/u, '').toLowerCase()
+      const cand = target.replace(/[\\/]+$/u, '').toLowerCase()
+      if (cand === base || cand.startsWith(`${base}\\`) || cand.startsWith(`${base}/`)) return text
+    }
+    fail(
+      `${label} 不在已登记工作区里，也不是本会话工作目录：${target}\n` +
+        `两条出路：①在 GUI 里把该目录「添加为工作区」后再传；②确认要越界时，给插件配置 allowUnregisteredWorkspace: true。`,
+    )
+  }
+
+  tool({
+    name: 'ws_index_show',
+    description:
+      'Read-only: show the workspace index-memory block exactly as this plugin injects it into the system prompt, plus which file was found and its size/mtime. Use it to verify that a workspace index is really being injected.',
+    parameters: {
+      type: 'object',
+      properties: {
+        workspace: { type: 'string', description: "Absolute workspace directory; defaults to this session's working directory." },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args, exec) {
+      const target = args.workspace !== undefined && args.workspace !== null && String(args.workspace).trim() !== ''
+        ? assertUsablePath(args.workspace, 'workspace')
+        : wsIndexAgentCwd(exec && exec.agent)
+      if (target === '') return fail('读不到本会话的工作目录，请显式传 workspace。')
+      const file = wsIndexLocate(target, indexSettings.rel)
+      if (file === undefined) {
+        return ok(
+          `本工作区没有索引文件 ⇒ 本会话**没有**被注入。\n` +
+            `期望位置：${isAbsolute(indexSettings.rel) ? indexSettings.rel : join(target, indexSettings.rel)}\n` +
+            `写一份：ws_index_set(workspace=..., content=...)。`,
+        )
+      }
+      const entry = wsIndexRead(file)
+      if (entry.ok !== true) return fail(`索引文件存在但读不了：${entry.reason}（${file}）`)
+      return ok(
+        [
+          `注入开关：${indexSettings.enabled ? '已启用' : '已停用（配置 indexEnabled=false）'}`,
+          `索引文件：${file}`,
+          `大小：${entry.size} B / 注入上限 ${indexSettings.maxBytes} B`,
+          `更新：${new Date(entry.mtimeMs).toISOString()}`,
+          '',
+          wsIndexRender(entry, target, indexSettings.maxBytes),
+        ].join('\n'),
+      )
+    },
+  })
+
+  tool({
+    name: 'ws_index_set',
+    description:
+      'Write (replace or append) the workspace index-memory file that this plugin injects into every session of that workspace. Creates the .dsh-bot/ directory when missing.',
+    parameters: {
+      type: 'object',
+      properties: {
+        workspace: { type: 'string', description: 'Absolute workspace directory.' },
+        content: { type: 'string', description: 'Markdown to write.' },
+        mode: { type: 'string', enum: ['replace', 'append'], description: 'replace (default) overwrites the file; append adds after the existing body.' },
+      },
+      required: ['workspace', 'content'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args, exec) {
+      const ws = await assertWorkspaceScope(args.workspace, exec, 'workspace')
+      if (ws === '') return fail('workspace 不能为空。')
+      if (typeof args.content !== 'string' || args.content.trim() === '') return fail('content 不能为空。')
+      const file = isAbsolute(indexSettings.rel) ? indexSettings.rel : join(ws, indexSettings.rel)
+      const mode = args.mode === 'append' ? 'append' : 'replace'
+      try {
+        await mkdir(dirname(file), { recursive: true })
+        if (mode === 'append') {
+          let prev = ''
+          try {
+            prev = await readFile(file, 'utf8')
+          } catch {
+            prev = ''
+          }
+          const head = prev.trim() === '' ? '# 工作区索引记忆\n\n' : prev.replace(/\s*$/u, '\n')
+          await writeFile(file, `${head}\n${args.content.replace(/\r\n/g, '\n').trim()}\n`, 'utf8')
+        } else {
+          await writeFile(file, `${args.content.replace(/\r\n/g, '\n').trim()}\n`, 'utf8')
+        }
+      } catch (error) {
+        return fail(`写入失败：${error?.message ?? error}`)
+      }
+      WS_INDEX_CACHE.delete(file) // 立即失效：下一轮装配就读到新内容
+      const entry = wsIndexRead(file)
+      const size = entry.ok === true ? entry.size : 0
+      const over = size > indexSettings.maxBytes
+      return ok(
+        `${mode === 'append' ? '已追加' : '已写入'}：${file}（${size} B）。下一轮装配起自动注入。` +
+          (over ? `\n⚠ 已超过注入上限 ${indexSettings.maxBytes} B，注入时会被截断；建议把正文挪到别的文件、这里只留索引。` : ''),
+      )
     },
   })
 }

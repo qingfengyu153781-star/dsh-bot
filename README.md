@@ -26,7 +26,7 @@
 
 主位判定不靠名字：Bot 记录上有 `main: true`，一个工作区最多一个；切换时自动撤销旧主位，`changed` 会带 `名字#短id`（同名也能分辨）。
 
-## 工具（13 个）
+## 工具（15 个）
 
 | 工具 | 作用 |
 |---|---|
@@ -42,6 +42,35 @@
 | `group_set_mode` | 切换 `broadcast` / `round-robin`（仅主 Bot / 用户） |
 | `workspace_memory_remember` / `workspace_memory_recall` | 写 / 读某个工作区的记忆 |
 | `session_probe` | 诊断一条会话：inspect / projections / page / resolveAgent / 命令表 |
+| `ws_index_show` | 只读回显「注入到系统提示里的工作区索引块」，以及命中的文件/大小/mtime |
+| `ws_index_set` | 写（`replace`）或追加（`append`）工作区索引文件；写完立刻生效 |
+
+## 工作区索引记忆（ws-index，0.4.1 新增）
+
+给一个工作区放一份索引文件，该工作区**每个会话的每一轮**都自动带上它；内容改了下一轮就跟着变。
+
+| 项 | 值 |
+|---|---|
+| 索引文件默认路径 | `<workspace>/.dsh-bot/WS_INDEX.md` |
+| 注入方式 | `systemPrompt.context`（每轮装配时取值，**不是** `section`——后者注册时就固定了） |
+| 归属规则 | 从会话 cwd **向上查找**最近的索引文件（最多 12 层）；子目录会话因此归到所在工作区 |
+| 注入上限 | 默认 8192 B，超了按 UTF-8 边界截断并明示；可配（512–65536） |
+| 去重 | 索引文件**不许叫** `AGENTS.md` / `CLAUDE.md`：这两个名字归宿主 `agent-instructions` 管，插件再注入一遍就是重复 |
+| 失败行为 | 文件缺失 / 读失败 / 渲染异常 → **返回空串 + 记一行日志**，绝不抛（这条路径每轮都跑，抛一次毁掉整个工作区） |
+
+配置：
+
+```yaml
+- insert:
+    - id: bot-ours
+      name: '@local/dsh-bot'
+      config:
+        indexEnabled: true                 # false = 关掉注入
+        indexFile: .dsh-bot/WS_INDEX.md    # 相对 workspace，或绝对路径
+        indexMaxBytes: 8192
+        indexOrder: 7000                   # 系统提示里的排序
+        allowUnregisteredWorkspace: false  # 见「安全边界」
+```
 
 ## 群聊的两种模式
 
@@ -102,6 +131,25 @@ groupmode    ★ 切换本群发言模式：轮流发言（成员互相看见）
 
 本仓库**只含插件本体**。安装到 profile 的辅助脚本（含本机绝对路径）不随仓库发布。
 
+## 安全边界（0.4.1，回应外部审计 issue #1）
+
+| 项 | 口径 |
+|---|---|
+| **身份识别**（P1） | `callerBot()` 认三个来源：`bot.sessionId`（当前主会话）、`bot.history[]`（`bot_open` 之后的旧会话）、`group.branches[botId].sessionId`（群分支会话）。三个都不是的会话按「用户」放行——因为用户自己的会话也不在 Bot 登记里，默认拒绝会误伤用户。 |
+| **工作区闸** | `bot_create` / `group_create` / `workspace_memory_remember` / `ws_index_set` 只接受**已登记工作区**或**本会话 cwd 及其子目录**；其余拒绝并提示两条出路。要越界必须显式 `allowUnregisteredWorkspace: true`。 |
+| **收养去重** | `group_create` 带 `sessionId` 时，若该会话已属于别的群则拒绝——一个会话只能属于一个群。 |
+| **投递失败分类** | 群成员会话被占（`already owned` / `writer-held`）判**可重试**：投递层退避重投 3 次，本轮末尾再补投一次；其他错误判**永久失败**，不重投。 |
+| **群轮次落盘** | 每轮结束先 `flushStateWrites()` 再释放群队列，避免下一轮读到 150ms 合并写之前的旧快照（丢 `log`/`rounds`）。 |
+
+回归测试（仓库内，可直接跑）：
+
+```sh
+node test/group_queue.test.mjs
+node test/test_ws_index.mjs        # 28 项
+node test/test_perm_matrix.mjs     # 14 项
+node test/test_ws_scope_retry.mjs  #  9 项
+```
+
 ## 许可证
 
-未附开源许可证（保留所有权利）。公开仓库只放插件本体与文档，不含本机路径、会话记录或项目数据。
+MIT（见 `LICENSE`）。公开仓库只放插件本体与文档，不含本机路径、会话记录或项目数据。

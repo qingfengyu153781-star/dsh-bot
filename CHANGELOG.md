@@ -1,3 +1,64 @@
+# 更新报告 · @local/dsh-bot 0.4.1（2026-10-22）
+
+回应外部审计 [issue #1](https://github.com/qingfengyu153781-star/dsh-bot/issues/1)（等级三深度审计）。
+本版只做**修复与新增能力**，不改既有工具签名。
+
+## 一、P1 权限绕过（已修，含审计未发现的第二个入口）
+
+**根因**：`callerBot()` 只按 `bot.sessionId === exec.agent.id` 认人。凡是不等于该 Bot **当前主会话**的会话，
+一律被当作「用户」，于是 `main` 闸门失效。`callerBot()` 是单一入口，5 个闸门共用：
+`bot_create`、`bot_set_main`、`bot_open`、`group_create`、`group_set_mode`。
+
+**两个入口**（均在临时 `DSH_HOME` 下复现）：
+
+| # | 入口 | 修复前 |
+|---|---|---|
+| 1 | 群成员分支会话（审计报告的那条） | `bot_set_main` 返回 `changed: -wb1 +n1`，角色 Bot 自封主位 |
+| 2 | **`bot_open` 之后的旧会话**（本版新发现） | 同样自封成功；**不需要群**，角色 Bot 只要开过一次新对话就有后门 |
+
+**修复**：`callerBot()` 认三个来源——`bot.sessionId`、`bot.history[]`、`group.branches[botId].sessionId`。
+三者都不在的会话仍按「用户」放行（用户自己的会话同样不在 Bot 登记里，默认拒绝会误伤用户）。
+
+## 二、收养去重
+
+`group_create` 带 `sessionId` 时，若该会话已属于别的群则拒绝。此前同一会话可以同时出现在两个群里。
+
+## 三、工作区闸
+
+`workspace` 参数此前接受任意绝对路径（只拦控制字符），记忆/索引可被写到仓库外任意可写目录。
+现在只放行**已登记工作区**或**本会话 cwd 及其子目录**；要越界必须显式配置 `allowUnregisteredWorkspace: true`。
+
+## 四、投递失败分类
+
+群成员会话被占（`already owned by an active turn` / `session/writer-held`）此前整轮失败且无重试语义。
+现在：投递层按占用类错误退避重投 3 次；仍失败且判定**可重试**的成员，本轮末尾再补投一次；
+其他错误判**永久失败**，不重投。返回里明确标出「可重试 / 永久失败 / 已补投 N 位 / 仍被占用」。
+
+## 五、群轮次落盘（96a45860 补回）
+
+每轮结束先 `flushStateWrites()` 再释放群队列，避免下一轮读到 150ms 合并写之前的旧快照（丢 `log`/`rounds`）。
+
+## 六、新增：工作区索引记忆（ws-index）
+
+每轮自动把 `<workspace>/.dsh-bot/WS_INDEX.md` 注入系统提示（`systemPrompt.context`），
+从会话 cwd 向上查找归属、8 KB 上限、失败静默降级、与宿主 `AGENTS.md` 注入去重。
+新增两个工具：`ws_index_show`（只读回显注入块）、`ws_index_set`（写入/追加）。
+
+## 七、许可证与版本
+
+- 补 MIT `LICENSE`（此前无许可证＝保留所有权利，无法合规分发）；
+- `package.json` 版本从 `0.1.0` 对齐到 `0.4.1`（此前元数据陈旧，外部按包元数据判版本会判错）。
+
+## 八、回归测试
+
+```sh
+node test/test_ws_index.mjs        # 28 项
+node test/test_perm_matrix.mjs     # 14 项（含变异对照：打修复前的文件会红 7 项）
+node test/test_ws_scope_retry.mjs  #  9 项（含变异对照：打修复前的文件会红 5 项）
+```
+
+---
+
 # 更新报告 · @local/dsh-bot 0.4.0（2026-10-18 晚）
 
 相对 0.3.0，三件事：**并发放开**、**群成员按「群 × Bot」彻底隔离**、**状态读写性能**。
