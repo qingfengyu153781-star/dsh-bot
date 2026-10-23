@@ -1,17 +1,18 @@
 {
   "name": "@local/dsh-bot",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "private": true,
-  "license": "MIT",
   "type": "module",
   "description": "Workspace-scoped Bots with per-workspace memory and group sessions, for DeepSeek Harness.",
   "exports": {
     ".": "./index.js",
+    "./dispatcher": "./dispatcher.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "dispatcher.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",

@@ -17,6 +17,7 @@ import { appendFileSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile, appendFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { installDispatcher } from './dispatcher.js'
 
 export const name = '@local/dsh-bot'
 export const inject = ['tools']
@@ -197,7 +198,7 @@ function fail(text) {
 }
 
 /**
- * 路径里的控制字符闸（实测：`D:\myproject` 被写成单反斜杠后，
+ * 路径里的控制字符闸（实测：`<盘符>:\project` 被写成单反斜杠后，
  * `\a` / `\b` 变成控制字符，建目录/登记都落到了错的地方，现象是"路径对不上"）。
  * 这里直接拦住并给出可照抄的正确写法，避免悄悄地建出怪目录。
  */
@@ -208,7 +209,7 @@ function assertUsablePath(value, label) {
     const code = bad[0].codePointAt(0).toString(16).padStart(4, '0')
     fail(
       `${label} 里含控制字符 U+${code.toUpperCase()}（通常是 JSON 里把反斜杠写成了单个 \\，` +
-        `例如 "D:\\myproject" 会被解析成 \\a、\\b）。请写成 "D:\\\\myproject" 或改用 /。`,
+        `例如 "<盘符>:\\project" 会被解析成 \\a、\\b）。请写成 "<盘符>:\\\\project" 或改用 /。`,
     )
   }
   return text
@@ -218,6 +219,95 @@ function findBot(state, key) {
   if (!key) return undefined
   const byName = Object.values(state.bots).find(bot => bot.name === key)
   return byName ?? state.bots[key]}
+
+/**
+ * 名字归一化：把「人写的名字」解析成「真实的 Bot」。
+ *
+ * 动机：2026-10-23 实测 53 次消息通道故障，全部是**名字形式不对**而非名字真错：
+ *   [主] 灵枢文档下载…  ·  缺陷拆解-3 **C「做完了…」**  ·  裁决-3  ·  【审查-2B · v4 …】
+ * findBot 是严格相等，差一个字就 Unknown Bot。
+ *
+ * 返回 { bot, how, tried }：
+ *   bot   找到的 Bot 对象（找不到为 undefined）
+ *   how   用哪种方式命中的（exact / id / strip-prefix / strip-quote / prefix / contains）
+ *   tried 尝试过的所有归一化形式（报错时用来提示）
+ *
+ * ⚠ 精确匹配永远第一优先，不改变任何现有成功路径。
+ * ⚠ 包含匹配只在唯一候选时采纳；有歧义就返回 undefined 并给候选，绝不瞎猜。
+ */
+function resolveBotKey(state, key) {
+  const tried = []
+  if (key === undefined || key === null) return { bot: undefined, how: 'none', tried }
+  const raw = String(key)
+  if (raw.trim() === '') return { bot: undefined, how: 'none', tried }
+
+  const all = Object.values(state.bots)
+
+  // ① 精确名 / 精确 id —— 原逻辑，最高优先
+  const exact = findBot(state, raw)
+  if (exact) return { bot: exact, how: 'exact', tried }
+
+  // 归一化候选（按"信息损失从小到大"排列）
+  const forms = []
+  const add = (v) => { const t = String(v).trim(); if (t && !forms.includes(t)) forms.push(t) }
+
+  // 全角 → 半角（含全角空格 U+3000）
+  const half = raw.replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, ' ')
+  add(half)
+
+  // ② 去前缀：[主] [群] [Bot] 【…】 (…)
+  const stripPrefix = half
+    .replace(/^\s*[\[【(（][^\]】)）]{0,20}[\]】)）]\s*/, '')
+    .replace(/^\s*(主|群|Bot|bot|MAIN|main)\s*[:：]\s*/, '')
+  add(stripPrefix)
+
+  // ③ 去引号 / 反引号 / 多余空白
+  const stripQuote = stripPrefix.replace(/[\s"'\u0060]+/g, ' ').replace(/^\s+|\s+$/g, '')
+  add(stripQuote)
+
+  // 逐个试精确匹配
+  for (const f of forms) {
+    const hit = findBot(state, f)
+    if (hit) return { bot: hit, how: 'normalized', tried: [...tried, f] }
+    tried.push(f)
+  }
+
+  // ④ 前缀匹配：key 是某个 Bot 名的前缀（如 core-3 → team-core-3）
+  //    取最长的唯一前缀，避免短前缀同时匹配 team-core-1/2/3。
+  const pool = [raw, ...forms].map((v) => v.trim()).filter(Boolean)
+  for (const f of pool) {
+    if (f.length < 2) continue
+    const hits = all.filter((b) => b.name.startsWith(f) || f.startsWith(b.name))
+    if (hits.length === 1) return { bot: hits[0], how: 'prefix', tried }
+    if (hits.length > 1) {
+      // 有歧义：如果其中一个是另一个的精确扩展，不猜，直接返回候选
+      return { bot: undefined, how: 'ambiguous', tried, candidates: hits.map((b) => b.name) }
+    }
+  }
+
+  // ⑤ 包含匹配：Bot 名包含 key（唯一才采纳）
+  for (const f of pool) {
+    if (f.length < 3) continue
+    const hits = all.filter((b) => b.name.includes(f))
+    if (hits.length === 1) return { bot: hits[0], how: 'contains', tried }
+    if (hits.length > 1) return { bot: undefined, how: 'ambiguous', tried, candidates: hits.map((b) => b.name) }
+  }
+
+  // 全失败：给出最接近的候选（按公共前缀长度排序）
+  const near = all
+    .map((b) => {
+      let n = 0
+      const a = raw.trim()
+      while (n < Math.min(a.length, b.name.length) && a[n] === b.name[n]) n++
+      return { name: b.name, score: n }
+    })
+    .filter((x) => x.score >= 2)
+    .sort((x, y) => y.score - x.score)
+    .slice(0, 5)
+    .map((x) => x.name)
+
+  return { bot: undefined, how: 'not-found', tried, candidates: near }
+}
 
 function findGroup(state, key) {
   if (!key) return undefined
@@ -1297,8 +1387,8 @@ export function apply(ctx, config = {}) {
     parameters: {
       type: 'object',
       properties: {
-        bot: { type: 'string', description: 'Bot name or id.' },
-        text: { type: 'string', description: 'Message to deliver. `message` 是同一参数的别名。' },
+        bot: { type: 'string', description: 'Bot 名字或 id。只放名字本身，不要带 [主] 之类前缀、不要混入正文（正文放 text）。写简称也能解析（如 core-3 → team-core-3）。' },
+        text: { type: 'string', description: 'Message to deliver. `message` 是同一参数的别名。40 字内，内容放任务板上。' },
         message: { type: 'string', description: 'Alias of `text`；两者给一个即可。' },
       },
       required: ['bot'],
@@ -1307,8 +1397,32 @@ export function apply(ctx, config = {}) {
     output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
     async execute(args) {
       const state = await loadStateInPlugin()
-      const bot = findBot(state, args.bot)
-      if (!bot) return fail(`Unknown Bot: ${args.bot}`)
+
+      // 名字解析：精确优先，其次归一化/前缀/唯一包含。
+      // 2026-10-23 实测 53 次 Unknown Bot 全部是**形式差异**而非真错名，
+      // 所以这里先尽力解析，解析成功就在回执里说明「我替你补全了」。
+      const resolved = resolveBotKey(state, args.bot)
+      const bot = resolved.bot
+      if (!bot) {
+        const tried = (resolved.tried || []).filter(Boolean)
+        const cands = resolved.candidates || []
+        const lines = []
+        if (args.bot === undefined || args.bot === null || String(args.bot).trim() === '') {
+          lines.push('bot_message 缺少 bot 参数。')
+          lines.push('正确形状：{ "bot": "<Bot名>", "text": "<40字内的一句话>" }')
+        } else if (resolved.how === 'ambiguous') {
+          lines.push(`Bot 名字有歧义：${String(args.bot).slice(0, 60)}`)
+          lines.push(`候选（请写全名）：${cands.join(' / ')}`)
+        } else {
+          lines.push(`Unknown Bot: ${String(args.bot).slice(0, 80)}`)
+          if (tried.length) lines.push(`已尝试的归一化形式：${tried.slice(0, 4).join(' / ')}`)
+          if (cands.length) lines.push(`最接近的候选：${cands.join(' / ')}`)
+          if (String(args.bot).length > 40) {
+            lines.push('提示：bot 字段只放 Bot 名字本身；正文请放 text 字段。')
+          }
+        }
+        return fail(lines.join(' '))
+      }
       const body = String(args.text ?? args.message ?? '').trim()
       if (body === '') return fail('bot_message 需要非空的 text（或 message）。')
       await promptSession(bot.sessionId, body)
@@ -1326,8 +1440,12 @@ export function apply(ctx, config = {}) {
         wake = 'unavailable'
         code = error && error.code ? String(error.code) : ''
       }
+      // 自动解析过就在回执里说明，避免"我明明写的是 X，怎么发给了 Y"的困惑
+      const note = resolved.how === 'exact'
+        ? ''
+        : `（名字 ${String(args.bot).slice(0, 30)} 已自动解析为 ${bot.name}）`
       if (wake === 'ready') {
-        return ok(`已投递并且已唤醒：${bot.name}（session ${bot.sessionId}）会在这个会话里回复。`)
+        return ok(`已投递并且已唤醒：${bot.name}${note}（session ${bot.sessionId}）会在这个会话里回复。`)
       }
       const reason = code === '' ? '' : `，宿主返回 ${code}`
       return ok(
@@ -2226,6 +2344,155 @@ export function apply(ctx, config = {}) {
         `${mode === 'append' ? '已追加' : '已写入'}：${file}（${size} B）。` +
           `下一轮装配起，只有 **${bot.name}** 自己的会话会看到这段；其他 Bot 与用户会话看不到。` +
           (over ? `\n⚠ 已超过注入上限 ${indexSettings.botMaxBytes} B，注入时会被截断。` : ''),
+      )
+    },
+  })
+
+  // ── bot_note：不唤醒的投递（R25 需求侧）────────────────────────────
+  // 为什么要它：实测 9866 个 turn 里，F+P×steps 的固定开销只占 12.2%，
+  // 所以「每轮多吃几条」最多只值 1.14×（见 dispatcher.js 头注释）。
+  // 真正的大头是**根本不该占一个 turn 的消息**：汇报、抄送、规则广播。
+  // 一条这样的消息占掉一个 turn，就占掉 293.5s 的并发槽。
+  // bot_note 把它降级成一次文件追加：不建 turn、不花模型调用，
+  // 收件人下次干活时自己读（就像读任务板一样）。
+  const NOTE_DIR = join(HOME, 'bot-ours', 'notes')
+
+  tool({
+    name: 'bot_note',
+    description:
+      'Leave a note for a Bot WITHOUT waking it. Use this for reports, status updates, FYI, and rule broadcasts — anything the recipient does not need to act on immediately. It appends to that Bot note file and costs no model turn; the recipient reads it the next time it works. Use bot_message only when the recipient must act now.',
+    parameters: {
+      type: 'object',
+      properties: {
+        bot: { type: 'string', description: 'Bot name or id.' },
+        text: { type: 'string', description: 'Note content.' },
+        from: { type: 'string', description: 'Optional sender label.' },
+      },
+      required: ['bot'],
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args) {
+      const state = await loadStateInPlugin()
+      const bot = findBot(state, args.bot)
+      if (!bot) return fail(`Unknown Bot: ${args.bot}`)
+      const body = String(args.text ?? '').trim()
+      if (body === '') return fail('bot_note 需要非空的 text。')
+      const who = String(args.from ?? '').trim()
+      const line = JSON.stringify({
+        at: new Date().toISOString(),
+        from: who === '' ? null : who,
+        text: body,
+      })
+      try {
+        await mkdir(NOTE_DIR, { recursive: true })
+        await appendFile(join(NOTE_DIR, `${bot.name}.jsonl`), line + '\n', 'utf8')
+      } catch (error) {
+        return fail(`写便签失败：${error?.message ?? error}`)
+      }
+      return ok(
+        `已留给 ${bot.name}（不唤醒）。它下次干活时会读到；这条没有占用任何 turn。`,
+      )
+    },
+  })
+
+  tool({
+    name: 'bot_notes_read',
+    description:
+      'Read and clear the notes left for a Bot by bot_note. A Bot calls this at the start of its own turn to pick up reports and broadcasts without them having ever cost a turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        bot: { type: 'string', description: 'Bot name or id. Omit to read notes for the calling Bot if resolvable.' },
+        keep: { type: 'boolean', description: 'true = do not clear after reading (default false).' },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args) {
+      const state = await loadStateInPlugin()
+      const bot = findBot(state, args.bot)
+      if (!bot) return fail(`Unknown Bot: ${args.bot}`)
+      const file = join(NOTE_DIR, `${bot.name}.jsonl`)
+      let raw = ''
+      try { raw = await readFile(file, 'utf8') } catch { return ok(`（${bot.name} 没有待读便签）`) }
+      const items = raw.split('\n').filter(l => l.trim() !== '').map(l => {
+        try { return JSON.parse(l) } catch { return { at: '', from: null, text: l } }
+      })
+      if (items.length === 0) return ok(`（${bot.name} 没有待读便签）`)
+      if (args.keep !== true) {
+        try { await writeFile(file, '', 'utf8') } catch { /* 清不掉就留着，下次再读 */ }
+      }
+      const lines = items.map((n, i) =>
+        `${i + 1}. [${n.at || '?'}]${n.from ? ` ${n.from}：` : ' '}${n.text}`)
+      return ok(`${bot.name} 的便签 ${items.length} 条${args.keep === true ? '（未清空）' : '（已清空）'}：\n${lines.join('\n')}`)
+    },
+  })
+
+  // ── 事件驱动调度器（R25）──────────────────────────────────────────
+  // 装在本插件里，不另起插件。理由见 dispatcher.js 头注释：
+  // 实测吞吐 = 并发 / (F + P×steps)，批量只值 1.14×，唯一大杠杆是「让空出来的槽立刻被填上」。
+  // 触发源用宿主自己的 'api-session/status'（idle/running），频率天然等于吞吐。
+  const dispatcherEnabled = !/^(0|false|off)$/i.test(String(process.env.DSH_BOT_DISPATCH ?? 'on'))
+  const dispatcher = installDispatcher(ctx, {
+    config: {
+      // 板目录优先级：插件 config（cordis.patch.yml）> 环境变量 > 通用默认。
+      // 不给默认私有路径 —— 这是公开仓库，硬编码本机路径会泄露也会让别人跑不起来。
+      boardRoot: (typeof config.boardRoot === 'string' && config.boardRoot.trim() !== '')
+        ? config.boardRoot.trim()
+        : (process.env.DSH_BOT_BOARD
+          ? String(process.env.DSH_BOT_BOARD)
+          : join(homedir(), '.dsh-bot', 'board')),
+    },
+    log: (message) => {
+      try { console.error(`[dsh-bot/dispatcher] ${message}`) } catch { /* ignore */ }
+    },
+    prompt: (sessionId, text) => promptSession(sessionId, text),
+    listBots: async () => {
+      const state = await loadStateInPlugin()
+      return Object.values(state.bots)
+        .filter(bot => bot && typeof bot.name === 'string' && typeof bot.sessionId === 'string')
+        .map(bot => ({ name: bot.name, sessionId: bot.sessionId, workspace: bot.workspace }))
+    },
+  })
+  if (!dispatcherEnabled) dispatcher.setEnabled(false)
+  ctx.effect(() => () => dispatcher.dispose())
+
+  tool({
+    name: 'bot_dispatch',
+    description:
+      'Inspect or drive the event-driven task dispatcher that runs inside this plugin. It wakes an idle Bot only when the task board has work that belongs to it; an empty board costs nothing. Actions: status (default) | tick (force one round now) | on | off.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'status (default) | tick | on | off' },
+      },
+      additionalProperties: false,
+    },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_a, v) => [{ type: 'text', text: String(v.text) }] },
+    async execute(args) {
+      const action = String(args.action ?? 'status').toLowerCase()
+      if (action === 'on') { dispatcher.setEnabled(true); return ok('调度器已开启。下一次 idle 事件起生效。') }
+      if (action === 'off') { dispatcher.setEnabled(false); return ok('调度器已关闭（不再自动唤醒）。') }
+      if (action === 'tick') {
+        const r = await dispatcher.tick()
+        return ok(
+          `手动 tick：${r.ok === true ? 'ok' : 'failed'}，唤醒 ${r.wakes ?? 0} 个。\n` +
+          `原因：${r.reason}\n` +
+          (r.stats ? `板况：${JSON.stringify(r.stats)}` : ''),
+        )
+      }
+      const s = dispatcher.status()
+      return ok(
+        `调度器 ${s.enabled ? '开启' : '关闭'}\n` +
+        `板目录：${s.config.boardRoot}\n` +
+        `并发上限：${s.config.maxConcurrent}　单轮最多唤醒：${s.config.maxWakePerRound}\n` +
+        `累计 tick：${s.metrics.ticks}　累计唤醒：${s.metrics.wakes}\n` +
+        `最近 tick：${s.metrics.lastTickAt ?? '（还没跑过）'}\n` +
+        `最近原因：${s.metrics.lastReason || '—'}\n` +
+        `跟踪中的会话：${s.busyTracked}（其中在跑 ${s.runningCount}）\n` +
+        `失败冷却中：${s.cooldowns}\n` +
+        (s.metrics.lastError ? `最近错误：${s.metrics.lastError}` : ''),
       )
     },
   })

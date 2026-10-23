@@ -1,3 +1,13 @@
 node_modules/
 *.log
 
+# 备份文件（含本机路径与旧版本，不入库）
+*.bak_*
+*.bak.*
+
+# 测试文件（本地验证用，不入库）
+test/
+
+# 临时：从远程备份下来的测试文件（不入库）
+.remote_tests_backup/
+.remote_*.js

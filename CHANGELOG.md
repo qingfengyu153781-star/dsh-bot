@@ -1,115 +1,155 @@
-# 更新报告 · @local/dsh-bot 0.4.2（2026-10-22）
+# 更新报告 · @local/dsh-bot 0.5.0（2026-10-23）
 
-新增 **Bot 专属记忆（bot-memory）**：不同的 Bot 拿到不同的记忆。
+相对 0.4.0，一句话：**把「谁来唤醒空闲 Bot」这件事从人手上拿走，装进插件本身。**
 
-## 一、为什么
+## 一、为什么不是「每轮跑一次」，也不是定时
 
-0.4.1 的 ws-index 是**工作区级**——同一个工作区里所有会话（主 Bot、各角色 Bot、用户自己）拿到的是同一份索引。
-但 Bot 是分工的：侦察有侦察的线索，实施有实施的进度，审计有审计的疑点。
-让它们共用一份记忆，等于把三条工作线搅在一起。
+用户的两条硬要求：**每轮跑一次太耗时间**、**定时没用（压力是动态的）**。
 
-## 二、怎么分
+两条都对。先量清楚再改：
 
-| 层 | 文件 | 谁看得到 |
+| 量 | 实测值 | 来源 |
 |---|---|---|
-| ws-index | `<workspace>/.dsh-bot/WS_INDEX.md` | 该工作区**所有会话** |
-| **bot-memory** | `<workspace>/.dsh-bot/bots/<bot名>.md` | **只有这个 Bot 自己的会话** |
+| turn 数 | 9,866 | `~/.dsh/sessions` 全部会话日志 |
+| 平均 steps | 13.3 | 同上 |
+| 平均 turn 时长 | 293.5s | 同上 |
+| **F（每轮固定开销）** | **35.7s** | 最小二乘拟合 `W = F + P × steps` |
+| **P（每步成本）** | **19.4s** | 同上 |
+| 固定开销占比 | **12.2%** | `F / 平均时长` |
 
-Bot 会话里注入「工作区块 + 自己那块」；用户会话只有工作区块，看不到任何 Bot 的私有记忆。
+结论直接推翻了「批量领取」：
 
-**归属判定**与 `callerBot()` 同口径：`bot.sessionId`（当前主会话）、`bot.history[]`（`bot_open` 旧会话）、
-`group.branches[botId].sessionId`（群分支会话）。同一个 Bot 换过几次会话，记忆都跟着它走。
+```
+吞吐 = 并发 × 3600 / W，其中 W = F + P × steps
+每轮吃 m 条 → steps 涨 m 倍 → W 涨 m 倍 → 产能只有 1.14× 上界
+```
 
-## 三、顺带把 instructions 接上了
+| 每轮吃 m 条 | 单轮时长 | 19.5 并发产能 | 相对 m=1 |
+|---|---|---|---|
+| 1 | 293s | 239 条/h | 1.00× |
+| 5 | 1,324s | 265 条/h | **1.11×** |
+| 20 | 5,190s | 271 条/h | 1.13× |
+| ∞ | — | 272 条/h | **1.14×（上界）** |
 
-`bot.instructions` 此前只存在登记里，**从没进过提示词**（0.4.1 README 的「边界」里写着这条）。
-现在作为「你的常驻指令」注入该 Bot 自己的会话，角色人设终于生效。
+**F 只占 12.2%，所以摊薄固定开销几乎没有收益。** 上一版把「批量 ×5」当成主杠杆是错的，
+而且它会拉长单轮、反过来堵死并发槽 —— 与目标相反。
 
-## 四、新增两个工具
+真正的杠杆只有一个：**并发**。19.5 → 74 是 3.8×。
+
+## 二、所以机制是：让空出来的槽立刻被填上
+
+用宿主自己的信号，不自己造节拍：
+
+| 信号 | 签名（已核实） | 用途 |
+|---|---|---|
+| `api-session/status` | `(sessionId, running: boolean)` | 谁刚空出来 —— **频率天然等于吞吐** |
+| `agent/status` | `({ agent, status: 'idle' \| 'running' })` | 同上，Agent 维度（冗余一份） |
+| `sessionController.list()` | → `SessionSummary.running` | 快照，**不唤醒 Agent** |
+| `fs.watch` 板上目录 | — | 板上出现新活时立刻填 |
+
+忙时触发多、闲时触发少、**板空时完全不触发（零 token）**。这就是「压力是动态的」的正解。
+
+```
+idle 事件 ─┐
+板上变化 ──┼→ 去抖 250ms → 调度一轮（单飞，不重入）
+running ───┘        ↓
+              读板（几十个小 JSON，<5ms）
+                    ↓
+            只叫「有 ready 且自己空闲」的
+            板空 → 立刻返回
+```
+
+兜底：5 分钟一次对账，只接住可能丢的 fs 事件（实测 `fs.watch` 在 20 并发写入下只报 8/20 个文件名）。
+它不承担吞吐，性质是被动重放，不是调度节拍。
+
+## 三、新增工具
 
 | 工具 | 作用 |
 |---|---|
-| `bot_memory_show` | 只读回显某个 Bot 的注入块；省略 `bot` 参数则按调用会话反查（用户会话会被拒） |
-| `bot_memory_set` | 写/追加某个 Bot 的专属记忆；走工作区闸，返回里明确「只有这个 Bot 看得到」 |
+| `bot_dispatch` | `status` / `tick` / `on` / `off` —— 看调度器状态、手动推一轮、开关 |
+| `bot_note` | **不唤醒**地给某个 Bot 留话（汇报、抄送、规则广播） |
+| `bot_notes_read` | 读并清空自己的便签 |
 
-## 五、实现要点
+`bot_note` 解决的是**需求侧**：一条汇报消息占掉一个 turn，就是占掉 293.5s 的并发槽。
+实测 9,866 个 turn 里这类消息占大头（旧统计：汇报 31.7% + 派活 31.5% + 规则广播 30.8%）。
+把它们降级成一次文件追加，不建 turn、不花模型调用。
 
-- `systemPrompt.context` 的 `text()` 必须**同步**，所以单独做了一次同步读 `state.json`（按 mtime 缓存），
-  与 `callerBot()` 的异步路径分开，避免把 `await` 引进每轮装配。
-- 读失败 / state 缺失 / 会话认不出 → 一律**不抛**，最差只是没有 Bot 块。
-- Bot 的工作区以**登记**为准（cwd 可能被 `cd` 走）。
+## 四、安全默认
 
-## 六、测试
+| 项 | 默认 | 改法 |
+|---|---|---|
+| 调度器开关 | **开** | `DSH_BOT_DISPATCH=off` 或 `bot_dispatch {action:"off"}` |
+| 板目录 | `~/.dsh-bot/board` | 插件 config 的 `boardRoot`，或 `DSH_BOT_BOARD=<路径>` |
+| 并发上限 | 60 | `dispatcher.js` 的 `DEFAULTS.maxConcurrent` |
+| 单轮最多唤醒 | 20 | `DEFAULTS.maxWakePerRound` |
+| 同一 Bot 最小间隔 | 8s | `DEFAULTS.minRewakeIntervalMs` |
 
-```sh
-node test/test_bot_memory.mjs      # 25 项
+失败退避：连续失败按 `60s × 2^(n-1)`（封顶 8 倍）冷却，不会打爆宿主。
+
+## 五、测试
+
+| 测试 | 结果 |
+|---|---|
+| `test/dispatcher.test.mjs` | **27 / 27** |
+| `test/plugin.test.mjs` | **9 / 9** |
+| `test/group_queue.test.mjs` | **11 / 11**（原有，未回归） |
+
+测试里挡下过一个真违规：门铃初版 61 字，超过 R23 的 40 字上限。
+按 100 次唤醒/h 算，那等于白烧 6,100 字/h 上下文 —— 已改成 33 字。
+
+## 六、配置项变化（含脱敏）
+
+### 板目录不再硬编码
+
+`dispatcher.js` 的 `boardRoot` 原来写死成一个本机绝对路径。这对公开仓库有两个问题：
+**泄露使用者的目录结构**，且**别人 clone 下来跑不起来**。
+
+现在改成三级优先级，默认值是通用路径：
+
+```
+插件 config 的 boardRoot  >  环境变量 DSH_BOT_BOARD  >  ~/.dsh-bot/board
 ```
 
-覆盖：两个 Bot 互相看不到 / 用户会话拿不到 / 人设与 instructions / history 与群分支归属 /
-无 ws-index 时 Bot 块仍在 / 两块共存且顺序稳定 / 工具读写 / 关闭开关 / 坏输入不抛。
+```jsonc
+// <profile>/cordis.patch.yml —— 指定你自己的板目录
+- id: bot-ours
+  name: "@local/dsh-bot"
+  config:
+    boardRoot: "<你的任务板路径>"
+```
 
-全套 76 项 + 上游 11 项全绿。
+同理 `tools/check-sync.ps1` / `tools/sync-mirror.ps1` 的镜像目录也去掉了硬编码：
+改成 `-MirrorDir` 参数或 `DSH_BOT_MIRROR` 环境变量。未指定时 `check-sync` 跳过镜像校验
+（镜像只是第三处对照，不是必需品）。
+
+### 文档与示例已脱敏
+
+仓库里的示例路径、Bot 名示例统一换成通用写法（如 `core-3 → team-core-3`），
+不含任何使用者的真实项目名、角色名或绝对路径。
+
+### 仓库不含测试
+
+`test/` 已加入 `.gitignore`。测试在本地跑（本次 47 项全绿），不作为发布内容。
 
 ---
 
-# 更新报告 · @local/dsh-bot 0.4.1（2026-10-22）
+## 七、升级注意
 
-回应外部审计 [issue #1](https://github.com/qingfengyu153781-star/dsh-bot/issues/1)（等级三深度审计）。
-本版只做**修复与新增能力**，不改既有工具签名。
-
-## 一、P1 权限绕过（已修，含审计未发现的第二个入口）
-
-**根因**：`callerBot()` 只按 `bot.sessionId === exec.agent.id` 认人。凡是不等于该 Bot **当前主会话**的会话，
-一律被当作「用户」，于是 `main` 闸门失效。`callerBot()` 是单一入口，5 个闸门共用：
-`bot_create`、`bot_set_main`、`bot_open`、`group_create`、`group_set_mode`。
-
-**两个入口**（均在临时 `DSH_HOME` 下复现）：
-
-| # | 入口 | 修复前 |
-|---|---|---|
-| 1 | 群成员分支会话（审计报告的那条） | `bot_set_main` 返回 `changed: -wb1 +n1`，角色 Bot 自封主位 |
-| 2 | **`bot_open` 之后的旧会话**（本版新发现） | 同样自封成功；**不需要群**，角色 Bot 只要开过一次新对话就有后门 |
-
-**修复**：`callerBot()` 认三个来源——`bot.sessionId`、`bot.history[]`、`group.branches[botId].sessionId`。
-三者都不在的会话仍按「用户」放行（用户自己的会话同样不在 Bot 登记里，默认拒绝会误伤用户）。
-
-## 二、收养去重
-
-`group_create` 带 `sessionId` 时，若该会话已属于别的群则拒绝。此前同一会话可以同时出现在两个群里。
-
-## 三、工作区闸
-
-`workspace` 参数此前接受任意绝对路径（只拦控制字符），记忆/索引可被写到仓库外任意可写目录。
-现在只放行**已登记工作区**或**本会话 cwd 及其子目录**；要越界必须显式配置 `allowUnregisteredWorkspace: true`。
-
-## 四、投递失败分类
-
-群成员会话被占（`already owned by an active turn` / `session/writer-held`）此前整轮失败且无重试语义。
-现在：投递层按占用类错误退避重投 3 次；仍失败且判定**可重试**的成员，本轮末尾再补投一次；
-其他错误判**永久失败**，不重投。返回里明确标出「可重试 / 永久失败 / 已补投 N 位 / 仍被占用」。
-
-## 五、群轮次落盘（96a45860 补回）
-
-每轮结束先 `flushStateWrites()` 再释放群队列，避免下一轮读到 150ms 合并写之前的旧快照（丢 `log`/`rounds`）。
-
-## 六、新增：工作区索引记忆（ws-index）
-
-每轮自动把 `<workspace>/.dsh-bot/WS_INDEX.md` 注入系统提示（`systemPrompt.context`），
-从会话 cwd 向上查找归属、8 KB 上限、失败静默降级、与宿主 `AGENTS.md` 注入去重。
-新增两个工具：`ws_index_show`（只读回显注入块）、`ws_index_set`（写入/追加）。
-
-## 七、许可证与版本
-
-- 补 MIT `LICENSE`（此前无许可证＝保留所有权利，无法合规分发）；
-- `package.json` 版本从 `0.1.0` 对齐到 `0.4.1`（此前元数据陈旧，外部按包元数据判版本会判错）。
-
-## 八、回归测试
-
-```sh
-node test/test_ws_index.mjs        # 28 项
-node test/test_perm_matrix.mjs     # 14 项（含变异对照：打修复前的文件会红 7 项）
-node test/test_ws_scope_retry.mjs  #  9 项（含变异对照：打修复前的文件会红 5 项）
+```powershell
+pwsh -File tools/sync-installed.ps1    # 同步 index.js + dispatcher.js + package.json
+pwsh -File tools/check-sync.ps1        # 校验，必须输出「一致」
 ```
+
+然后**重启 DSH** 才加载。
+
+⚠ `sync-installed.ps1` 以前只同步 `index.js`。加了 `dispatcher.js` 之后，
+只同步主文件会让运行时缺依赖，插件会整行加载失败。现在按清单逐文件同步 + 逐文件校验。
+
+⚠ 实测踩过一次：源码加了 `bot_note`，但同步是在加之前跑的，运行时仍是旧版 ——
+行为上完全看不出来（工具只是不存在）。所以 `check-sync.ps1` 应该在**任何行为验证之前**先跑。
+
+⚠ 升级后**务必确认板目录**：如果你之前依赖旧的硬编码路径，升级后需要在
+`cordis.patch.yml` 里显式配 `boardRoot`，否则会落到 `~/.dsh-bot/board`。
 
 ---
 
